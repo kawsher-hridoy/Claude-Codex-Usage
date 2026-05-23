@@ -18,33 +18,50 @@ def get_dashboard_data(db_path=DB_PATH):
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    try:
+        import scanner
+        scanner.init_db(conn)
+    except Exception:
+        pass
 
-    # ── All models (for filter UI) ────────────────────────────────────────────
-    model_rows = conn.execute("""
-        SELECT COALESCE(model, 'unknown') as model
+    # ── Providers and models (for filter UI) ────────────────────────────────
+    provider_rows = conn.execute("""
+        SELECT COALESCE(provider, 'claude') as provider
         FROM turns
-        GROUP BY model
+        GROUP BY COALESCE(provider, 'claude')
+        ORDER BY provider
+    """).fetchall()
+    all_providers = [r["provider"] for r in provider_rows]
+
+    model_rows = conn.execute("""
+        SELECT
+            COALESCE(provider, 'claude') as provider,
+            COALESCE(model, 'unknown')   as model
+        FROM turns
+        GROUP BY COALESCE(provider, 'claude'), COALESCE(model, 'unknown')
         ORDER BY SUM(input_tokens + output_tokens) DESC
     """).fetchall()
-    all_models = [r["model"] for r in model_rows]
+    all_models = [{"provider": r["provider"], "model": r["model"]} for r in model_rows]
 
     # ── Daily per-model, ALL history (client filters by range) ────────────────
     daily_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)   as day,
-            COALESCE(model, 'unknown') as model,
+            substr(timestamp, 1, 10)     as day,
+            COALESCE(provider, 'claude') as provider,
+            COALESCE(model, 'unknown')   as model,
             SUM(input_tokens)          as input,
             SUM(output_tokens)         as output,
             SUM(cache_read_tokens)     as cache_read,
             SUM(cache_creation_tokens) as cache_creation,
             COUNT(*)                   as turns
         FROM turns
-        GROUP BY day, model
-        ORDER BY day, model
+        GROUP BY day, COALESCE(provider, 'claude'), COALESCE(model, 'unknown')
+        ORDER BY day, provider, model
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
+        "provider":       r["provider"],
         "model":          r["model"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
@@ -59,18 +76,20 @@ def get_dashboard_data(db_path=DB_PATH):
         SELECT
             substr(timestamp, 1, 10)                  as day,
             CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
+            COALESCE(provider, 'claude')              as provider,
             COALESCE(model, 'unknown')                as model,
             SUM(output_tokens)                        as output,
             COUNT(*)                                  as turns
         FROM turns
         WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, model
-        ORDER BY day, hour, model
+        GROUP BY day, hour, COALESCE(provider, 'claude'), COALESCE(model, 'unknown')
+        ORDER BY day, hour, provider, model
     """).fetchall()
 
     hourly_by_model = [{
         "day":    r["day"],
         "hour":   r["hour"] if r["hour"] is not None else 0,
+        "provider": r["provider"],
         "model":  r["model"],
         "output": r["output"] or 0,
         "turns":  r["turns"] or 0,
@@ -79,7 +98,7 @@ def get_dashboard_data(db_path=DB_PATH):
     # ── All sessions (client filters by range and model) ──────────────────────
     session_rows = conn.execute("""
         SELECT
-            session_id, project_name, first_timestamp, last_timestamp,
+            session_id, COALESCE(provider, 'claude') as provider, project_name, first_timestamp, last_timestamp,
             total_input_tokens, total_output_tokens,
             total_cache_read, total_cache_creation, model, turn_count,
             git_branch
@@ -96,7 +115,8 @@ def get_dashboard_data(db_path=DB_PATH):
         except Exception:
             duration_min = 0
         sessions_all.append({
-            "session_id":    r["session_id"][:8],
+            "session_id":    r["session_id"][6:14] if (r["provider"] == "codex" and r["session_id"].startswith("codex:")) else r["session_id"][:8],
+            "provider":      r["provider"],
             "project":       r["project_name"] or "unknown",
             "branch":        r["git_branch"] or "",
             "last":          (r["last_timestamp"] or "")[:16].replace("T", " "),
@@ -113,6 +133,7 @@ def get_dashboard_data(db_path=DB_PATH):
     conn.close()
 
     return {
+        "all_providers":   all_providers,
         "all_models":      all_models,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
@@ -126,7 +147,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Code Usage Dashboard</title>
+<title>Claude + Codex Usage Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
@@ -152,11 +173,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #filter-bar { background: var(--card); border-bottom: 1px solid var(--border); padding: 10px 24px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .filter-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
   .filter-sep { width: 1px; height: 22px; background: var(--border); flex-shrink: 0; }
-  #model-checkboxes { display: flex; flex-wrap: wrap; gap: 6px; }
-  .model-cb-label { display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 12px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; }
-  .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
-  .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
-  .model-cb-label input { display: none; }
+  #provider-checkboxes, #model-checkboxes { display: flex; flex-wrap: wrap; gap: 6px; }
+  .provider-cb-label, .model-cb-label { display: flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; border: 1px solid var(--border); cursor: pointer; font-size: 12px; color: var(--muted); transition: border-color 0.15s, color 0.15s, background 0.15s; user-select: none; }
+  .provider-cb-label:hover, .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
+  .provider-cb-label.checked, .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
+  .provider-cb-label input, .model-cb-label input { display: none; }
   .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
@@ -198,7 +219,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   td { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: rgba(255,255,255,0.02); }
-  .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
+  .provider-tag, .model-tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; background: rgba(79,142,247,0.15); color: var(--blue); }
+  .provider-tag { background: rgba(217,119,87,0.14); color: var(--accent); margin-right: 6px; text-transform: capitalize; }
   .cost { color: var(--green); font-family: monospace; }
   .cost-na { color: var(--muted); font-family: monospace; font-size: 11px; }
   .num { font-family: monospace; }
@@ -222,12 +244,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>Claude Code Usage Dashboard</h1>
+  <h1>Claude + Codex Usage Dashboard</h1>
   <div class="meta" id="meta">Loading...</div>
   <button id="rescan-btn" onclick="triggerRescan()" title="Rebuild the database from scratch by re-scanning all JSONL files. Use if data looks stale or costs seem wrong.">&#x21bb; Rescan</button>
 </header>
 
 <div id="filter-bar">
+  <div class="filter-label">Providers</div>
+  <div id="provider-checkboxes"></div>
+  <div class="filter-sep"></div>
   <div class="filter-label">Models</div>
   <div id="model-checkboxes"></div>
   <button class="filter-btn" onclick="selectAllModels()">All</button>
@@ -279,6 +304,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-title">Cost by Model</div>
     <table>
       <thead><tr>
+        <th>Provider</th>
         <th>Model</th>
         <th class="sortable" onclick="setModelSort('turns')">Turns <span class="sort-icon" id="msort-turns"></span></th>
         <th class="sortable" onclick="setModelSort('input')">Input <span class="sort-icon" id="msort-input"></span></th>
@@ -295,6 +321,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <table>
       <thead><tr>
         <th>Session</th>
+        <th>Provider</th>
         <th>Project</th>
         <th class="sortable" onclick="setSessionSort('last')">Last Active <span class="sort-icon" id="sort-icon-last"></span></th>
         <th class="sortable" onclick="setSessionSort('duration_min')">Duration <span class="sort-icon" id="sort-icon-duration_min"></span></th>
@@ -311,6 +338,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-header"><div class="section-title">Cost by Project</div><button class="export-btn" onclick="exportProjectsCSV()" title="Export all projects to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
+        <th>Provider</th>
         <th>Project</th>
         <th class="sortable" onclick="setProjectSort('sessions')">Sessions <span class="sort-icon" id="psort-sessions"></span></th>
         <th class="sortable" onclick="setProjectSort('turns')">Turns <span class="sort-icon" id="psort-turns"></span></th>
@@ -325,6 +353,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="section-header"><div class="section-title">Cost by Project &amp; Branch</div><button class="export-btn" onclick="exportProjectBranchCSV()" title="Export project+branch breakdown to CSV">&#x2913; CSV</button></div>
     <table>
       <thead><tr>
+        <th>Provider</th>
         <th>Project</th>
         <th>Branch</th>
         <th class="sortable" onclick="setProjectBranchSort('sessions')">Sessions <span class="sort-icon" id="pbsort-sessions"></span></th>
@@ -340,9 +369,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <footer>
   <div class="footer-content">
-    <p>Cost estimates based on Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>) as of April 2026. Only models containing <em>opus</em>, <em>sonnet</em>, or <em>haiku</em> in the name are included in cost calculations. Actual costs for Max/Pro subscribers differ from API pricing.</p>
+    <p>Claude cost estimates use Anthropic API pricing (<a href="https://claude.com/pricing#api" target="_blank">claude.com/pricing#api</a>), and GPT/Codex estimates use OpenAI API pricing (<a href="https://openai.com/api/pricing/" target="_blank">openai.com/api/pricing</a>) as of May 2026. Actual costs for Max/Pro subscribers differ from API pricing.</p>
     <p>
-      GitHub: <a href="https://github.com/phuryn/claude-usage" target="_blank">https://github.com/phuryn/claude-usage</a>
+      GitHub: <a href="https://github.com/kawsher-hridoy/Claude-Codex-Usage" target="_blank">https://github.com/kawsher-hridoy/Claude-Codex-Usage</a>
       &nbsp;&middot;&nbsp;
       Created by: <a href="https://www.productcompass.pm" target="_blank">The Product Compass Newsletter</a>
       &nbsp;&middot;&nbsp;
@@ -361,6 +390,7 @@ function esc(s) {
 
 // ── State ──────────────────────────────────────────────────────────────────
 let rawData = null;
+let selectedProviders = new Set();
 let selectedModels = new Set();
 let selectedRange = '30d';
 let charts = {};
@@ -417,7 +447,7 @@ function tzDisplayName(tzMode) {
   }
 }
 
-// ── Pricing (Anthropic API, April 2026) ────────────────────────────────────
+// ── Pricing (Anthropic + OpenAI API, May 2026) ─────────────────────────────
 const PRICING = {
   'claude-opus-4-7':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
   'claude-opus-4-6':   { input:  5.00, output: 25.00, cache_write:  6.25, cache_read: 0.50 },
@@ -428,24 +458,40 @@ const PRICING = {
   'claude-haiku-4-7':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
   'claude-haiku-4-6':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
   'claude-haiku-4-5':  { input:  1.00, output:  5.00, cache_write:  1.25, cache_read: 0.10 },
+  'gpt-5.5-pro':       { input: 30.00, output: 180.00, cache_write: 0.00,  cache_read: 0.00 },
+  'gpt-5.5':           { input:  5.00, output:  30.00, cache_write: 0.00,  cache_read: 0.50 },
+  'gpt-5.4-pro':       { input: 30.00, output: 180.00, cache_write: 0.00,  cache_read: 0.00 },
+  'gpt-5.4-mini':      { input:  0.75, output:   4.50, cache_write: 0.00,  cache_read: 0.075 },
+  'gpt-5.4-nano':      { input:  0.20, output:   1.25, cache_write: 0.00,  cache_read: 0.02 },
+  'gpt-5.4':           { input:  2.50, output:  15.00, cache_write: 0.00,  cache_read: 0.25 },
+  'gpt-5.3-codex':     { input:  1.75, output:  14.00, cache_write: 0.00,  cache_read: 0.175 },
 };
 
+function modelKey(provider, model) { return provider + '/' + model; }
+function modelLabel(row) { return row.provider + '/' + row.model; }
+
 function isBillable(model) {
-  if (!model) return false;
-  const m = model.toLowerCase();
-  return m.includes('opus') || m.includes('sonnet') || m.includes('haiku');
+  return !!getPricing(model);
 }
 
 function getPricing(model) {
   if (!model) return null;
   if (PRICING[model]) return PRICING[model];
-  for (const key of Object.keys(PRICING)) {
+  const keys = Object.keys(PRICING).sort((a, b) => b.length - a.length);
+  for (const key of keys) {
     if (model.startsWith(key)) return PRICING[key];
   }
   const m = model.toLowerCase();
-  if (m.includes('opus'))   return PRICING['claude-opus-4-7'];
+  if (m.includes('opus')) return PRICING['claude-opus-4-7'];
   if (m.includes('sonnet')) return PRICING['claude-sonnet-4-6'];
-  if (m.includes('haiku'))  return PRICING['claude-haiku-4-5'];
+  if (m.includes('haiku')) return PRICING['claude-haiku-4-5'];
+  if (m.includes('gpt-5.5-pro')) return PRICING['gpt-5.5-pro'];
+  if (m.includes('gpt-5.5')) return PRICING['gpt-5.5'];
+  if (m.includes('gpt-5.4-pro')) return PRICING['gpt-5.4-pro'];
+  if (m.includes('gpt-5.4-mini')) return PRICING['gpt-5.4-mini'];
+  if (m.includes('gpt-5.4-nano')) return PRICING['gpt-5.4-nano'];
+  if (m.includes('gpt-5.4')) return PRICING['gpt-5.4'];
+  if (m.includes('gpt-5.3-codex')) return PRICING['gpt-5.3-codex'];
   return null;
 }
 
@@ -459,6 +505,14 @@ function calcCost(model, inp, out, cacheRead, cacheCreation) {
     cacheRead     * p.cache_read  / 1e6 +
     cacheCreation * p.cache_write / 1e6
   );
+}
+
+function isCodexProvider(provider) {
+  return String(provider || '').toLowerCase() === 'codex';
+}
+
+function cacheCreationDisplay(provider, value) {
+  return isCodexProvider(provider) ? 'n/a' : fmt(value || 0);
 }
 
 // ── Formatting ─────────────────────────────────────────────────────────────
@@ -553,33 +607,66 @@ function modelPriority(m) {
   return 3;
 }
 
-function readURLModels(allModels) {
-  const param = new URLSearchParams(window.location.search).get('models');
-  if (!param) return new Set(allModels.filter(m => isBillable(m)));
+function readURLProviders(allProviders) {
+  const param = new URLSearchParams(window.location.search).get('providers');
+  if (!param) return new Set(allProviders);
   const fromURL = new Set(param.split(',').map(s => s.trim()).filter(Boolean));
-  return new Set(allModels.filter(m => fromURL.has(m)));
+  return new Set(allProviders.filter(p => fromURL.has(p)));
+}
+
+function readURLModels(allModels) {
+  const keys = allModels.map(m => modelKey(m.provider, m.model));
+  const param = new URLSearchParams(window.location.search).get('models');
+  if (!param) return new Set(keys);
+  const fromURL = new Set(param.split(',').map(s => s.trim()).filter(Boolean));
+  return new Set(keys.filter(k => fromURL.has(k)));
+}
+
+function isDefaultProviderSelection(allProviders) {
+  if (selectedProviders.size !== allProviders.length) return false;
+  return allProviders.every(p => selectedProviders.has(p));
 }
 
 function isDefaultModelSelection(allModels) {
-  const billable = allModels.filter(m => isBillable(m));
-  if (selectedModels.size !== billable.length) return false;
-  return billable.every(m => selectedModels.has(m));
+  const keys = allModels.map(m => modelKey(m.provider, m.model));
+  if (selectedModels.size !== keys.length) return false;
+  return keys.every(k => selectedModels.has(k));
 }
 
-function buildFilterUI(allModels) {
+function buildFilterUI(allProviders, allModels) {
+  selectedProviders = readURLProviders(allProviders);
+  const providerContainer = document.getElementById('provider-checkboxes');
+  providerContainer.innerHTML = allProviders.map(p => {
+    const checked = selectedProviders.has(p);
+    return `<label class="provider-cb-label ${checked ? 'checked' : ''}" data-provider="${esc(p)}">
+      <input type="checkbox" value="${esc(p)}" ${checked ? 'checked' : ''} onchange="onProviderToggle(this)">
+      ${esc(p)}
+    </label>`;
+  }).join('');
+
   const sorted = [...allModels].sort((a, b) => {
-    const pa = modelPriority(a), pb = modelPriority(b);
-    return pa !== pb ? pa - pb : a.localeCompare(b);
+    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
+    const pa = modelPriority(a.model), pb = modelPriority(b.model);
+    return pa !== pb ? pa - pb : a.model.localeCompare(b.model);
   });
   selectedModels = readURLModels(allModels);
   const container = document.getElementById('model-checkboxes');
   container.innerHTML = sorted.map(m => {
-    const checked = selectedModels.has(m);
-    return `<label class="model-cb-label ${checked ? 'checked' : ''}" data-model="${esc(m)}">
-      <input type="checkbox" value="${esc(m)}" ${checked ? 'checked' : ''} onchange="onModelToggle(this)">
-      ${esc(m)}
+    const key = modelKey(m.provider, m.model);
+    const checked = selectedModels.has(key);
+    return `<label class="model-cb-label ${checked ? 'checked' : ''}" data-model="${esc(key)}">
+      <input type="checkbox" value="${esc(key)}" ${checked ? 'checked' : ''} onchange="onModelToggle(this)">
+      ${esc(key)}
     </label>`;
   }).join('');
+}
+
+function onProviderToggle(cb) {
+  const label = cb.closest('label');
+  if (cb.checked) { selectedProviders.add(cb.value); label.classList.add('checked'); }
+  else            { selectedProviders.delete(cb.value); label.classList.remove('checked'); }
+  updateURL();
+  applyFilter();
 }
 
 function onModelToggle(cb) {
@@ -606,9 +693,11 @@ function clearAllModels() {
 
 // ── URL persistence ────────────────────────────────────────────────────────
 function updateURL() {
-  const allModels = Array.from(document.querySelectorAll('#model-checkboxes input')).map(cb => cb.value);
+  const allProviders = Array.from(document.querySelectorAll('#provider-checkboxes input')).map(cb => cb.value);
+  const allModels = (rawData && rawData.all_models) ? rawData.all_models : [];
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
+  if (!isDefaultProviderSelection(allProviders)) params.set('providers', Array.from(selectedProviders).join(','));
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
   history.replaceState(null, '', window.location.pathname + search);
@@ -657,9 +746,9 @@ function applyFilter() {
 
   const { start, end } = getRangeBounds(selectedRange);
 
-  // Filter daily rows by model + date range
+  // Filter daily rows by provider + model + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedModels.has(r.model) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && (!start || r.day >= start) && (!end || r.day <= end)
   );
 
   // Daily chart: aggregate by day
@@ -677,8 +766,9 @@ function applyFilter() {
   // By model: aggregate tokens + turns from daily data
   const modelMap = {};
   for (const r of filteredDaily) {
-    if (!modelMap[r.model]) modelMap[r.model] = { model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
-    const m = modelMap[r.model];
+    const key = modelKey(r.provider, r.model);
+    if (!modelMap[key]) modelMap[key] = { provider: r.provider, model: r.model, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0 };
+    const m = modelMap[key];
     m.input          += r.input;
     m.output         += r.output;
     m.cache_read     += r.cache_read;
@@ -688,12 +778,13 @@ function applyFilter() {
 
   // Filter sessions by model + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedModels.has(s.model) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
+    selectedProviders.has(s.provider) && selectedModels.has(modelKey(s.provider, s.model)) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
   );
 
   // Add session counts into modelMap
   for (const s of filteredSessions) {
-    if (modelMap[s.model]) modelMap[s.model].sessions++;
+    const key = modelKey(s.provider, s.model);
+    if (modelMap[key]) modelMap[key].sessions++;
   }
 
   const byModel = Object.values(modelMap).sort((a, b) => (b.input + b.output) - (a.input + a.output));
@@ -701,8 +792,9 @@ function applyFilter() {
   // By project: aggregate from filtered sessions
   const projMap = {};
   for (const s of filteredSessions) {
-    if (!projMap[s.project]) projMap[s.project] = { project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
-    const p = projMap[s.project];
+    const projKey = s.provider + '\x00' + s.project;
+    if (!projMap[projKey]) projMap[projKey] = { provider: s.provider, project: s.project, input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
+    const p = projMap[projKey];
     p.input          += s.input;
     p.output         += s.output;
     p.cache_read     += s.cache_read;
@@ -716,8 +808,8 @@ function applyFilter() {
   // By project+branch: aggregate from filtered sessions
   const projBranchMap = {};
   for (const s of filteredSessions) {
-    const key = s.project + '\x00' + (s.branch || '');
-    if (!projBranchMap[key]) projBranchMap[key] = { project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
+    const key = s.provider + '\x00' + s.project + '\x00' + (s.branch || '');
+    if (!projBranchMap[key]) projBranchMap[key] = { provider: s.provider, project: s.project, branch: s.branch || '', input: 0, output: 0, cache_read: 0, cache_creation: 0, turns: 0, sessions: 0, cost: 0 };
     const pb = projBranchMap[key];
     pb.input          += s.input;
     pb.output         += s.output;
@@ -737,12 +829,13 @@ function applyFilter() {
     output:         byModel.reduce((s, m) => s + m.output, 0),
     cache_read:     byModel.reduce((s, m) => s + m.cache_read, 0),
     cache_creation: byModel.reduce((s, m) => s + m.cache_creation, 0),
+    cache_creation_available: byModel.some(m => !isCodexProvider(m.provider)),
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
 
   // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedModels.has(r.model) && (!cutoff || r.day >= cutoff)
+    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && (!start || r.day >= start) && (!end || r.day <= end)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -751,7 +844,7 @@ function applyFilter() {
   document.getElementById('hourly-chart-title').textContent = 'Average Hourly Distribution \u2014 ' + RANGE_LABELS[selectedRange];
 
   renderStats(totals);
-  renderDailyChart(daily);
+  renderDailyChart(daily, totals.cache_creation_available);
   renderHourlyChart(hourlyAgg);
   renderModelChart(byModel);
   renderProjectChart(byProject);
@@ -773,8 +866,8 @@ function renderStats(t) {
     { label: 'Input Tokens',   value: fmt(t.input),                sub: rangeLabel },
     { label: 'Output Tokens',  value: fmt(t.output),               sub: rangeLabel },
     { label: 'Cache Read',     value: fmt(t.cache_read),           sub: 'from prompt cache' },
-    { label: 'Cache Creation', value: fmt(t.cache_creation),       sub: 'writes to prompt cache' },
-    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'API pricing, Apr 2026', color: '#4ade80' },
+    { label: 'Cache Creation', value: t.cache_creation_available ? fmt(t.cache_creation) : 'n/a', sub: t.cache_creation_available ? 'writes to prompt cache where logged' : 'not logged by Codex' },
+    { label: 'Est. Cost',      value: fmtCostBig(t.cost),          sub: 'Anthropic + OpenAI API pricing, May 2026', color: '#4ade80' },
   ];
   document.getElementById('stats-row').innerHTML = stats.map(s => `
     <div class="stat-card">
@@ -883,19 +976,22 @@ function renderHourlyChart(agg) {
   });
 }
 
-function renderDailyChart(daily) {
+function renderDailyChart(daily, cacheCreationAvailable) {
   const ctx = document.getElementById('chart-daily').getContext('2d');
   if (charts.daily) charts.daily.destroy();
+  const datasets = [
+    { label: 'Input',      data: daily.map(d => d.input),      backgroundColor: TOKEN_COLORS.input,      stack: 'io',    yAxisID: 'y1' },
+    { label: 'Output',     data: daily.map(d => d.output),     backgroundColor: TOKEN_COLORS.output,     stack: 'io',    yAxisID: 'y1' },
+    { label: 'Cache Read', data: daily.map(d => d.cache_read), backgroundColor: TOKEN_COLORS.cache_read, stack: 'cache', yAxisID: 'y' },
+  ];
+  if (cacheCreationAvailable) {
+    datasets.push({ label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'cache', yAxisID: 'y' });
+  }
   charts.daily = new Chart(ctx, {
     type: 'bar',
     data: {
       labels: daily.map(d => d.day),
-      datasets: [
-        { label: 'Input',          data: daily.map(d => d.input),          backgroundColor: TOKEN_COLORS.input,          stack: 'io',    yAxisID: 'y1' },
-        { label: 'Output',         data: daily.map(d => d.output),         backgroundColor: TOKEN_COLORS.output,         stack: 'io',    yAxisID: 'y1' },
-        { label: 'Cache Read',     data: daily.map(d => d.cache_read),     backgroundColor: TOKEN_COLORS.cache_read,     stack: 'cache', yAxisID: 'y' },
-        { label: 'Cache Creation', data: daily.map(d => d.cache_creation), backgroundColor: TOKEN_COLORS.cache_creation, stack: 'cache', yAxisID: 'y' },
-      ]
+      datasets: datasets
     },
     options: {
       responsive: true, maintainAspectRatio: false,
@@ -916,7 +1012,7 @@ function renderModelChart(byModel) {
   charts.model = new Chart(ctx, {
     type: 'doughnut',
     data: {
-      labels: byModel.map(m => m.model),
+      labels: byModel.map(m => m.provider + '/' + m.model),
       datasets: [{ data: byModel.map(m => m.input + m.output), backgroundColor: MODEL_COLORS, borderWidth: 2, borderColor: '#1a1d27' }]
     },
     options: {
@@ -962,6 +1058,7 @@ function renderSessionsTable(sessions) {
       : `<td class="cost-na">n/a</td>`;
     return `<tr>
       <td class="muted" style="font-family:monospace">${esc(s.session_id)}&hellip;</td>
+      <td><span class="provider-tag">${esc(s.provider)}</span></td>
       <td>${esc(s.project)}</td>
       <td class="muted">${esc(s.last)}</td>
       <td class="muted">${esc(s.duration_min)}m</td>
@@ -1014,12 +1111,13 @@ function renderModelCostTable(byModel) {
       ? `<td class="cost">${fmtCost(cost)}</td>`
       : `<td class="cost-na">n/a</td>`;
     return `<tr>
+      <td><span class="provider-tag">${esc(m.provider)}</span></td>
       <td><span class="model-tag">${esc(m.model)}</span></td>
       <td class="num">${fmt(m.turns)}</td>
       <td class="num">${fmt(m.input)}</td>
       <td class="num">${fmt(m.output)}</td>
       <td class="num">${fmt(m.cache_read)}</td>
-      <td class="num">${fmt(m.cache_creation)}</td>
+      <td class="num">${cacheCreationDisplay(m.provider, m.cache_creation)}</td>
       ${costCell}
     </tr>`;
   }).join('');
@@ -1045,6 +1143,7 @@ function updateProjectSortIcons() {
 
 function sortProjects(byProject) {
   return [...byProject].sort((a, b) => {
+    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
     const av = a[projectSortCol] ?? 0;
     const bv = b[projectSortCol] ?? 0;
     if (av < bv) return projectSortDir === 'desc' ? 1 : -1;
@@ -1056,6 +1155,7 @@ function sortProjects(byProject) {
 function renderProjectCostTable(byProject) {
   document.getElementById('project-cost-body').innerHTML = sortProjects(byProject).map(p => {
     return `<tr>
+      <td><span class="provider-tag">${esc(p.provider)}</span></td>
       <td>${esc(p.project)}</td>
       <td class="num">${p.sessions}</td>
       <td class="num">${fmt(p.turns)}</td>
@@ -1086,6 +1186,7 @@ function updateProjectBranchSortIcons() {
 
 function sortProjectBranch(rows) {
   return [...rows].sort((a, b) => {
+    if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
     const pa = (a.project || '').toLowerCase();
     const pb = (b.project || '').toLowerCase();
     if (pa < pb) return -1;
@@ -1101,6 +1202,7 @@ function sortProjectBranch(rows) {
 function renderProjectBranchCostTable(rows) {
   document.getElementById('project-branch-cost-body').innerHTML = sortProjectBranch(rows).map(pb => {
     return `<tr>
+      <td><span class="provider-tag">${esc(pb.provider)}</span></td>
       <td>${esc(pb.project)}</td>
       <td class="muted" style="font-family:monospace">${esc(pb.branch || '\u2014')}</td>
       <td class="num">${pb.sessions}</td>
@@ -1141,26 +1243,26 @@ function downloadCSV(reportType, header, rows) {
 }
 
 function exportSessionsCSV() {
-  const header = ['Session', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const header = ['Session', 'Provider', 'Project', 'Last Active', 'Duration (min)', 'Model', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastFilteredSessions.map(s => {
     const cost = calcCost(s.model, s.input, s.output, s.cache_read, s.cache_creation);
-    return [s.session_id, s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, s.cache_creation, cost.toFixed(4)];
+    return [s.session_id, s.provider, s.project, s.last, s.duration_min, s.model, s.turns, s.input, s.output, s.cache_read, cacheCreationDisplay(s.provider, s.cache_creation), cost.toFixed(4)];
   });
   downloadCSV('sessions', header, rows);
 }
 
 function exportProjectsCSV() {
-  const header = ['Project', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const header = ['Provider', 'Project', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastByProject.map(p => {
-    return [p.project, p.sessions, p.turns, p.input, p.output, p.cache_read, p.cache_creation, p.cost.toFixed(4)];
+    return [p.provider, p.project, p.sessions, p.turns, p.input, p.output, p.cache_read, cacheCreationDisplay(p.provider, p.cache_creation), p.cost.toFixed(4)];
   });
   downloadCSV('projects', header, rows);
 }
 
 function exportProjectBranchCSV() {
-  const header = ['Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
+  const header = ['Provider', 'Project', 'Branch', 'Sessions', 'Turns', 'Input', 'Output', 'Cache Read', 'Cache Creation', 'Est. Cost'];
   const rows = lastByProjectBranch.map(pb => {
-    return [pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, pb.cache_creation, pb.cost.toFixed(4)];
+    return [pb.provider, pb.project, pb.branch, pb.sessions, pb.turns, pb.input, pb.output, pb.cache_read, cacheCreationDisplay(pb.provider, pb.cache_creation), pb.cost.toFixed(4)];
   });
   downloadCSV('projects_by_branch', header, rows);
 }
@@ -1208,7 +1310,7 @@ async function loadData() {
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
       );
       // Build model filter (reads URL for model selection too)
-      buildFilterUI(d.all_models);
+      buildFilterUI(d.all_providers || ['claude'], d.all_models);
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
@@ -1274,6 +1376,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result = scanner.scan(
                 db_path=db_path,
                 projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
+                codex_sessions_dirs=scanner.DEFAULT_CODEX_SESSIONS_DIRS,
                 verbose=False,
             )
             body = json.dumps(result).encode("utf-8")

@@ -27,7 +27,7 @@ class TestGetDashboardData(unittest.TestCase):
         init_db(conn)
         # Insert sample data
         sessions = [{
-            "session_id": "sess-abc123", "project_name": "user/myproject",
+            "session_id": "sess-abc123", "provider": "claude", "project_name": "user/myproject",
             "first_timestamp": "2026-04-08T09:00:00Z",
             "last_timestamp": "2026-04-08T10:00:00Z",
             "git_branch": "main", "model": "claude-sonnet-4-6",
@@ -38,13 +38,13 @@ class TestGetDashboardData(unittest.TestCase):
         upsert_sessions(conn, sessions)
         turns = [
             {
-                "session_id": "sess-abc123", "timestamp": "2026-04-08T09:30:00Z",
+                "provider": "claude", "session_id": "sess-abc123", "timestamp": "2026-04-08T09:30:00Z",
                 "model": "claude-sonnet-4-6", "input_tokens": 500,
                 "output_tokens": 200, "cache_read_tokens": 50,
                 "cache_creation_tokens": 20, "tool_name": None, "cwd": "/tmp",
             },
             {
-                "session_id": "sess-abc123", "timestamp": "2026-04-08T14:15:00Z",
+                "provider": "claude", "session_id": "sess-abc123", "timestamp": "2026-04-08T14:15:00Z",
                 "model": "claude-sonnet-4-6", "input_tokens": 300,
                 "output_tokens": 150, "cache_read_tokens": 0,
                 "cache_creation_tokens": 0, "tool_name": None, "cwd": "/tmp",
@@ -59,6 +59,7 @@ class TestGetDashboardData(unittest.TestCase):
 
     def test_returns_valid_structure(self):
         data = get_dashboard_data(db_path=self.db_path)
+        self.assertIn("all_providers", data)
         self.assertIn("all_models", data)
         self.assertIn("daily_by_model", data)
         self.assertIn("sessions_all", data)
@@ -66,13 +67,15 @@ class TestGetDashboardData(unittest.TestCase):
 
     def test_models_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
-        self.assertIn("claude-sonnet-4-6", data["all_models"])
+        self.assertIn("claude", data["all_providers"])
+        self.assertIn({"provider": "claude", "model": "claude-sonnet-4-6"}, data["all_models"])
 
     def test_sessions_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertEqual(len(data["sessions_all"]), 1)
         session = data["sessions_all"][0]
         self.assertEqual(session["project"], "user/myproject")
+        self.assertEqual(session["provider"], "claude")
         self.assertEqual(session["model"], "claude-sonnet-4-6")
         self.assertEqual(session["input"], 5000)
 
@@ -81,6 +84,7 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertGreater(len(data["daily_by_model"]), 0)
         day = data["daily_by_model"][0]
         self.assertIn("day", day)
+        self.assertIn("provider", day)
         self.assertIn("model", day)
         self.assertIn("input", day)
 
@@ -119,7 +123,7 @@ class TestGetDashboardData(unittest.TestCase):
     def test_hourly_by_model_carries_day_and_model(self):
         data = get_dashboard_data(db_path=self.db_path)
         rows = data["hourly_by_model"]
-        self.assertTrue(all("day" in r and "model" in r for r in rows))
+        self.assertTrue(all("day" in r and "provider" in r and "model" in r for r in rows))
         self.assertTrue(all(r["model"] == "claude-sonnet-4-6" for r in rows))
         self.assertTrue(all(r["day"] == "2026-04-08" for r in rows))
 
@@ -138,11 +142,14 @@ class TestDashboardHTTP(unittest.TestCase):
         tmp = Path(cls._tmpdir.name)
         tmp_projects = tmp / "projects"
         tmp_projects.mkdir()
+        tmp_codex = tmp / "codex-sessions"
+        tmp_codex.mkdir()
         cls._patches = {
             (_d, "DB_PATH"):                (_d.DB_PATH,                tmp / "usage.db"),
             (_s, "DB_PATH"):                (_s.DB_PATH,                tmp / "usage.db"),
             (_s, "PROJECTS_DIR"):           (_s.PROJECTS_DIR,           tmp_projects),
             (_s, "DEFAULT_PROJECTS_DIRS"):  (_s.DEFAULT_PROJECTS_DIRS,  [tmp_projects]),
+            (_s, "DEFAULT_CODEX_SESSIONS_DIRS"): (_s.DEFAULT_CODEX_SESSIONS_DIRS, [tmp_codex]),
         }
         for (mod, name), (_orig, new) in cls._patches.items():
             setattr(mod, name, new)
@@ -174,6 +181,8 @@ class TestDashboardHTTP(unittest.TestCase):
             data = json.loads(resp.read())
             # Should have expected keys (or error if no DB)
             self.assertTrue("all_models" in data or "error" in data)
+            if "all_models" in data:
+                self.assertIn("all_providers", data)
 
     def test_api_rescan_returns_json(self):
         url = f"http://127.0.0.1:{self.port}/api/rescan"
@@ -214,8 +223,13 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn("m.includes('haiku')", HTML_TEMPLATE)
 
     def test_unknown_models_return_null(self):
-        """Verify getPricing returns null for non-Anthropic models."""
+        """Verify getPricing returns null for unknown models."""
         self.assertIn("return null;", HTML_TEMPLATE)
+
+    def test_provider_filter_present(self):
+        self.assertIn('id="provider-checkboxes"', HTML_TEMPLATE)
+        self.assertIn('function readURLProviders', HTML_TEMPLATE)
+        self.assertIn('modelKey(provider, model)', HTML_TEMPLATE)
 
     def test_hourly_chart_canvas_present(self):
         """Hourly distribution chart has a canvas + TZ toggle."""
@@ -223,10 +237,21 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn('data-tz="local"', HTML_TEMPLATE)
         self.assertIn('data-tz="utc"', HTML_TEMPLATE)
 
+    def test_hourly_filter_uses_range_bounds(self):
+        self.assertNotIn("cutoff", HTML_TEMPLATE)
+        self.assertIn("!start || r.day >= start", HTML_TEMPLATE)
+        self.assertIn("!end || r.day <= end", HTML_TEMPLATE)
+
     def test_hourly_peak_hour_constants(self):
         """Peak-hour set covers UTC 12–17 (Mon–Fri 05:00–11:00 PT)."""
         self.assertIn('PEAK_HOURS_UTC', HTML_TEMPLATE)
         self.assertIn('[12, 13, 14, 15, 16, 17]', HTML_TEMPLATE)
+
+    def test_codex_cache_creation_is_displayed_as_unavailable(self):
+        self.assertIn('function cacheCreationDisplay', HTML_TEMPLATE)
+        self.assertIn("isCodexProvider(provider) ? 'n/a'", HTML_TEMPLATE)
+        self.assertIn('not logged by Codex', HTML_TEMPLATE)
+        self.assertIn('renderDailyChart(daily, totals.cache_creation_available)', HTML_TEMPLATE)
 
 
 class TestPricingParity(unittest.TestCase):
@@ -237,7 +262,7 @@ class TestPricingParity(unittest.TestCase):
         import re
         prices = {}
         for match in re.finditer(
-            r"'(claude-[^']+)':\s*\{\s*input:\s*([\d.]+),\s*output:\s*([\d.]+)",
+            r"'([^']+)':\s*\{\s*input:\s*([\d.]+),\s*output:\s*([\d.]+)",
             HTML_TEMPLATE
         ):
             model, inp, out = match.group(1), float(match.group(2)), float(match.group(3))

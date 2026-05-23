@@ -9,7 +9,7 @@ from pathlib import Path
 
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
-    aggregate_sessions, upsert_sessions, insert_turns, scan,
+    parse_codex_jsonl_file, aggregate_sessions, upsert_sessions, insert_turns, scan,
 )
 
 
@@ -70,6 +70,41 @@ def _make_user_record(session_id="sess-1", timestamp="2026-04-08T09:59:00Z",
         "sessionId": session_id,
         "timestamp": timestamp,
         "cwd": cwd,
+    })
+
+
+def _make_codex_record(rtype, timestamp="2026-04-08T10:00:00Z", payload=None):
+    return json.dumps({
+        "type": rtype,
+        "timestamp": timestamp,
+        "payload": payload or {},
+    })
+
+
+def _make_codex_token_count(input_tokens, cached_input_tokens, output_tokens,
+                            total_input_tokens=None, total_cached_input_tokens=None,
+                            total_output_tokens=None, timestamp="2026-04-08T10:05:00Z"):
+    total_input_tokens = input_tokens if total_input_tokens is None else total_input_tokens
+    total_cached_input_tokens = cached_input_tokens if total_cached_input_tokens is None else total_cached_input_tokens
+    total_output_tokens = output_tokens if total_output_tokens is None else total_output_tokens
+    return _make_codex_record("event_msg", timestamp=timestamp, payload={
+        "type": "token_count",
+        "info": {
+            "last_token_usage": {
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": 5,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "total_token_usage": {
+                "input_tokens": total_input_tokens,
+                "cached_input_tokens": total_cached_input_tokens,
+                "output_tokens": total_output_tokens,
+                "reasoning_output_tokens": 5,
+                "total_tokens": total_input_tokens + total_output_tokens,
+            },
+        },
     })
 
 
@@ -326,6 +361,89 @@ class TestMessageIdDedupIntegration(unittest.TestCase):
         conn.close()
 
 
+class TestParseCodexJsonlFile(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def _write_jsonl(self, filename, lines):
+        path = os.path.join(self.tmpdir, filename)
+        with open(path, "w") as f:
+            for line in lines:
+                f.write(line + "\n")
+        return path
+
+    def test_codex_token_count_parsing(self):
+        path = self._write_jsonl("rollout-2026-04-08T10-00-00-sess.jsonl", [
+            _make_codex_record("session_meta", payload={
+                "id": "codex-sess",
+                "cwd": "/home/user/codex-project",
+                "git": {"branch": "main"},
+            }),
+            _make_codex_record("turn_context", payload={
+                "model": "gpt-5.1",
+                "cwd": "/home/user/codex-project",
+            }),
+            _make_codex_token_count(1000, 300, 120),
+        ])
+
+        metas, turns, line_count = parse_codex_jsonl_file(path)
+        self.assertEqual(line_count, 3)
+        self.assertEqual(len(metas), 1)
+        self.assertEqual(metas[0]["provider"], "codex")
+        self.assertEqual(metas[0]["session_id"], "codex:codex-sess")
+        self.assertEqual(metas[0]["project_name"], "user/codex-project")
+        self.assertEqual(metas[0]["git_branch"], "main")
+        self.assertEqual(metas[0]["model"], "gpt-5.1")
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["provider"], "codex")
+        self.assertEqual(turns[0]["input_tokens"], 700)
+        self.assertEqual(turns[0]["cache_read_tokens"], 300)
+        self.assertEqual(turns[0]["cache_creation_tokens"], 0)
+        self.assertEqual(turns[0]["output_tokens"], 120)
+        self.assertTrue(turns[0]["message_id"].startswith("codex:codex:codex-sess:"))
+
+    def test_codex_duplicate_cumulative_snapshots_are_deduped(self):
+        token = _make_codex_token_count(1000, 300, 120)
+        path = self._write_jsonl("rollout-2026-04-08T10-00-00-sess.jsonl", [
+            _make_codex_record("session_meta", payload={"id": "codex-sess", "cwd": "/tmp/project"}),
+            _make_codex_record("turn_context", payload={"model": "gpt-5.1", "cwd": "/tmp/project"}),
+            token,
+            token,
+        ])
+        _, turns, _ = parse_codex_jsonl_file(path)
+        self.assertEqual(len(turns), 1)
+
+
+class TestCodexScanIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.sessions_dir = Path(self.tmpdir) / "sessions" / "2026" / "04" / "08"
+        self.sessions_dir.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+
+    def test_scan_codex_sessions_dir(self):
+        path = self.sessions_dir / "rollout-2026-04-08T10-00-00-sess.jsonl"
+        with open(path, "w") as f:
+            f.write(_make_codex_record("session_meta", payload={"id": "codex-sess", "cwd": "/tmp/project"}) + "\n")
+            f.write(_make_codex_record("turn_context", payload={"model": "gpt-5.1", "cwd": "/tmp/project"}) + "\n")
+            f.write(_make_codex_token_count(1000, 300, 120) + "\n")
+
+        result = scan(codex_sessions_dir=Path(self.tmpdir) / "sessions", db_path=self.db_path, verbose=False)
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(result["turns"], 1)
+        self.assertEqual(result["sessions"], 1)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT * FROM sessions").fetchone()
+        turn = conn.execute("SELECT * FROM turns").fetchone()
+        conn.close()
+        self.assertEqual(session["provider"], "codex")
+        self.assertEqual(turn["provider"], "codex")
+        self.assertEqual(session["total_input_tokens"], 700)
+        self.assertEqual(session["total_cache_read"], 300)
+
+
 class TestAggregateSessions(unittest.TestCase):
     def test_aggregation(self):
         metas = [{"session_id": "s1", "project_name": "test",
@@ -374,6 +492,10 @@ class TestDatabaseOperations(unittest.TestCase):
         self.assertIn("sessions", table_names)
         self.assertIn("turns", table_names)
         self.assertIn("processed_files", table_names)
+        session_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        turn_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(turns)").fetchall()}
+        self.assertIn("provider", session_cols)
+        self.assertIn("provider", turn_cols)
 
     def test_init_db_is_idempotent(self):
         # Running init_db twice should not error
@@ -395,6 +517,7 @@ class TestDatabaseOperations(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertEqual(row["total_input_tokens"], 1000)
         self.assertEqual(row["turn_count"], 5)
+        self.assertEqual(row["provider"], "claude")
 
     def test_upsert_updates_existing_session(self):
         session = {
@@ -426,6 +549,7 @@ class TestDatabaseOperations(unittest.TestCase):
         rows = self.conn.execute("SELECT * FROM turns").fetchall()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["model"], "claude-sonnet-4-6")
+        self.assertEqual(rows[0]["provider"], "claude")
 
 
 class TestScanIntegration(unittest.TestCase):

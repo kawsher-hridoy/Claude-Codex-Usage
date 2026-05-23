@@ -1,5 +1,5 @@
 """
-scanner.py - Scans Claude Code JSONL transcript files and stores data in SQLite.
+scanner.py - Scans Claude Code and Codex JSONL transcript files into SQLite.
 """
 
 import json
@@ -7,14 +7,15 @@ import os
 import glob
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timezone
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
+CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DB_PATH = Path.home() / ".claude" / "usage.db"
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
+DEFAULT_CODEX_SESSIONS_DIRS = [CODEX_SESSIONS_DIR]
 
-# Higher number = higher priority when choosing a session's primary model
+# Higher number = higher priority when choosing a Claude session's primary model.
 MODEL_PRIORITY = {"opus": 3, "sonnet": 2, "haiku": 1}
 
 
@@ -29,8 +30,18 @@ def _model_priority(model):
     return 0
 
 
+def _choose_session_model(existing_model, new_model):
+    if not existing_model:
+        return new_model
+    if not new_model:
+        return existing_model
+    if _model_priority(new_model) > _model_priority(existing_model):
+        return new_model
+    return existing_model
+
+
 def get_db(db_path=DB_PATH):
-    # Ensure the parent directory exists — on a fresh install or CI runner
+    # Ensure the parent directory exists. On a fresh install or CI runner,
     # ~/.claude may not yet exist, and sqlite3.connect needs the parent dir.
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -38,10 +49,17 @@ def get_db(db_path=DB_PATH):
     return conn
 
 
+def _ensure_column(conn, table, column, ddl):
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db(conn):
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             session_id      TEXT PRIMARY KEY,
+            provider        TEXT DEFAULT 'claude',
             project_name    TEXT,
             first_timestamp TEXT,
             last_timestamp  TEXT,
@@ -56,6 +74,7 @@ def init_db(conn):
 
         CREATE TABLE IF NOT EXISTS turns (
             id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider                TEXT DEFAULT 'claude',
             session_id              TEXT,
             timestamp               TEXT,
             model                   TEXT,
@@ -73,17 +92,21 @@ def init_db(conn):
             mtime   REAL,
             lines   INTEGER
         );
-
-        CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
-        CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp);
     """)
-    # Add message_id column if upgrading from older schema
-    try:
-        conn.execute("SELECT message_id FROM turns LIMIT 1")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE turns ADD COLUMN message_id TEXT")
-    # Conditional unique index: only dedup non-null message IDs
+
+    _ensure_column(conn, "sessions", "provider", "provider TEXT DEFAULT 'claude'")
+    _ensure_column(conn, "turns", "provider", "provider TEXT DEFAULT 'claude'")
+    _ensure_column(conn, "turns", "message_id", "message_id TEXT")
+
+    conn.execute("UPDATE sessions SET provider = 'claude' WHERE provider IS NULL OR provider = ''")
+    conn.execute("UPDATE turns SET provider = 'claude' WHERE provider IS NULL OR provider = ''")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_provider ON turns(provider)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_timestamp ON turns(timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_first ON sessions(first_timestamp)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_provider ON sessions(provider)")
+    # Conditional unique index: only dedup non-null message IDs.
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message_id
         ON turns(message_id) WHERE message_id IS NOT NULL AND message_id != ''
@@ -95,23 +118,61 @@ def project_name_from_cwd(cwd):
     """Derive a friendly project name from cwd path."""
     if not cwd:
         return "unknown"
-    # Normalize to forward slashes, take last 2 components
     parts = cwd.replace("\\", "/").rstrip("/").split("/")
     if len(parts) >= 2:
         return "/".join(parts[-2:])
     return parts[-1] if parts else "unknown"
 
 
-def parse_jsonl_file(filepath):
-    """Parse a JSONL file and return (session_metas, turns, line_count).
+def _new_session_meta(session_id, provider, timestamp="", cwd="", git_branch="", model=None):
+    return {
+        "session_id": session_id,
+        "provider": provider,
+        "project_name": project_name_from_cwd(cwd),
+        "first_timestamp": timestamp,
+        "last_timestamp": timestamp,
+        "git_branch": git_branch or "",
+        "model": model,
+    }
 
-    Deduplicates streaming events by message.id — Claude Code logs multiple
-    JSONL records per API response, all sharing the same message.id. Only the
-    last record per message_id is kept (it has the final usage tallies).
+
+def _update_meta(meta, timestamp="", cwd="", git_branch="", model=None):
+    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
+        meta["first_timestamp"] = timestamp
+    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
+        meta["last_timestamp"] = timestamp
+    if cwd and (not meta["project_name"] or meta["project_name"] == "unknown"):
+        meta["project_name"] = project_name_from_cwd(cwd)
+    if git_branch and not meta["git_branch"]:
+        meta["git_branch"] = git_branch
+    if model:
+        meta["model"] = model
+
+
+def _int(value):
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_jsonl_file(filepath, provider="claude", start_line=0):
+    """Parse a JSONL file and return (session_metas, turns, line_count)."""
+    if provider == "codex":
+        return parse_codex_jsonl_file(filepath, start_line=start_line)
+    return parse_claude_jsonl_file(filepath, start_line=start_line)
+
+
+def parse_claude_jsonl_file(filepath, start_line=0):
+    """Parse a Claude Code JSONL transcript.
+
+    Deduplicates streaming events by message.id. Claude Code can log multiple
+    JSONL records per API response with the same message.id; the last one has
+    the final usage tallies.
     """
-    seen_messages = {}  # message_id -> turn dict (dedup streaming records)
-    turns_no_id = []    # turns without a message_id (kept as-is)
-    session_meta = {}   # session_id -> dict
+    seen_messages = {}
+    turns_no_id = []
+    session_meta = {}
     line_count = 0
 
     try:
@@ -137,74 +198,177 @@ def parse_jsonl_file(filepath):
                 cwd = record.get("cwd", "")
                 git_branch = record.get("gitBranch", "")
 
-                # Update session metadata from any record
                 if session_id not in session_meta:
-                    session_meta[session_id] = {
-                        "session_id": session_id,
-                        "project_name": project_name_from_cwd(cwd),
-                        "first_timestamp": timestamp,
-                        "last_timestamp": timestamp,
-                        "git_branch": git_branch,
-                        "model": None,
-                    }
+                    session_meta[session_id] = _new_session_meta(
+                        session_id, "claude", timestamp, cwd, git_branch
+                    )
                 else:
-                    meta = session_meta[session_id]
-                    if timestamp and (not meta["first_timestamp"] or timestamp < meta["first_timestamp"]):
-                        meta["first_timestamp"] = timestamp
-                    if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                        meta["last_timestamp"] = timestamp
-                    if git_branch and not meta["git_branch"]:
-                        meta["git_branch"] = git_branch
+                    _update_meta(session_meta[session_id], timestamp, cwd, git_branch)
 
-                if rtype == "assistant":
-                    msg = record.get("message", {})
-                    usage = msg.get("usage", {})
-                    model = msg.get("model", "")
-                    message_id = msg.get("id", "")
+                if line_count <= start_line:
+                    continue
 
-                    input_tokens = usage.get("input_tokens", 0) or 0
-                    output_tokens = usage.get("output_tokens", 0) or 0
-                    cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                    cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
+                if rtype != "assistant":
+                    continue
 
-                    # Only record turns that have actual token usage
-                    if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                        continue
+                msg = record.get("message", {})
+                usage = msg.get("usage", {})
+                model = msg.get("model", "")
+                message_id = msg.get("id", "")
 
-                    # Extract tool name from content if present
-                    tool_name = None
-                    for item in msg.get("content", []):
-                        if isinstance(item, dict) and item.get("type") == "tool_use":
-                            tool_name = item.get("name")
-                            break
+                input_tokens = _int(usage.get("input_tokens"))
+                output_tokens = _int(usage.get("output_tokens"))
+                cache_read = _int(usage.get("cache_read_input_tokens"))
+                cache_creation = _int(usage.get("cache_creation_input_tokens"))
 
-                    if model:
-                        session_meta[session_id]["model"] = model
+                if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                    continue
 
-                    turn = {
-                        "session_id": session_id,
-                        "timestamp": timestamp,
-                        "model": model,
-                        "input_tokens": input_tokens,
-                        "output_tokens": output_tokens,
-                        "cache_read_tokens": cache_read,
-                        "cache_creation_tokens": cache_creation,
-                        "tool_name": tool_name,
-                        "cwd": cwd,
-                        "message_id": message_id,
-                    }
+                tool_name = None
+                for item in msg.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        tool_name = item.get("name")
+                        break
 
-                    # Dedup: last record per message_id wins (final usage tallies)
-                    if message_id:
-                        seen_messages[message_id] = turn
-                    else:
-                        turns_no_id.append(turn)
+                _update_meta(session_meta[session_id], timestamp, cwd, git_branch, model)
+
+                turn = {
+                    "provider": "claude",
+                    "session_id": session_id,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read,
+                    "cache_creation_tokens": cache_creation,
+                    "tool_name": tool_name,
+                    "cwd": cwd,
+                    "message_id": message_id,
+                }
+
+                if message_id:
+                    seen_messages[message_id] = turn
+                else:
+                    turns_no_id.append(turn)
 
     except Exception as e:
         print(f"  Warning: error reading {filepath}: {e}")
 
-    turns = turns_no_id + list(seen_messages.values())
-    return list(session_meta.values()), turns, line_count
+    return list(session_meta.values()), turns_no_id + list(seen_messages.values()), line_count
+
+
+def _codex_session_id_from_path(filepath):
+    stem = Path(filepath).stem
+    if stem.startswith("rollout-"):
+        return stem[len("rollout-"):]
+    return stem
+
+
+def parse_codex_jsonl_file(filepath, start_line=0):
+    """Parse an OpenAI Codex rollout JSONL transcript.
+
+    Codex logs token usage as event_msg/token_count records. Each record carries
+    cumulative totals and a last_token_usage delta; the scanner stores the delta
+    and uses the cumulative totals as a stable deduplication key.
+    """
+    provider = "codex"
+    fallback_session_id = "codex:" + _codex_session_id_from_path(filepath)
+    session_id = fallback_session_id
+    session_meta = {}
+    turns_by_snapshot = {}
+    current_model = None
+    current_cwd = ""
+    git_branch = ""
+    line_count = 0
+
+    def ensure_meta(timestamp="", cwd="", model=None):
+        nonlocal session_id
+        if session_id not in session_meta:
+            session_meta[session_id] = _new_session_meta(
+                session_id, provider, timestamp, cwd or current_cwd, git_branch, model or current_model
+            )
+        else:
+            _update_meta(session_meta[session_id], timestamp, cwd or current_cwd, git_branch, model or current_model)
+        return session_meta[session_id]
+
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for line_count, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                rtype = record.get("type")
+                payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+                timestamp = record.get("timestamp") or payload.get("timestamp") or ""
+
+                if rtype == "session_meta":
+                    session_id = ("codex:" + payload.get("id")) if payload.get("id") else session_id
+                    current_cwd = payload.get("cwd") or current_cwd
+                    git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
+                    git_branch = git.get("branch") or git_branch
+                    ensure_meta(timestamp, current_cwd)
+                    continue
+
+                if rtype == "turn_context":
+                    current_model = payload.get("model") or current_model
+                    current_cwd = payload.get("cwd") or current_cwd
+                    ensure_meta(timestamp, current_cwd, current_model)
+                    continue
+
+                if line_count <= start_line:
+                    continue
+
+                if rtype != "event_msg" or payload.get("type") != "token_count":
+                    continue
+
+                info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+                last_usage = info.get("last_token_usage") if isinstance(info.get("last_token_usage"), dict) else {}
+                total_usage = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
+
+                input_total = _int(last_usage.get("input_tokens"))
+                cached_input = _int(last_usage.get("cached_input_tokens"))
+                uncached_input = max(input_total - cached_input, 0)
+                output_tokens = _int(last_usage.get("output_tokens"))
+
+                if uncached_input + cached_input + output_tokens == 0:
+                    continue
+
+                total_fingerprint = (
+                    _int(total_usage.get("input_tokens")),
+                    _int(total_usage.get("cached_input_tokens")),
+                    _int(total_usage.get("output_tokens")),
+                    _int(total_usage.get("reasoning_output_tokens")),
+                    _int(total_usage.get("total_tokens")),
+                )
+                if any(total_fingerprint):
+                    message_id = "codex:{}:{}:{}:{}:{}:{}".format(session_id, *total_fingerprint)
+                else:
+                    message_id = f"codex:{session_id}:line:{line_count}"
+
+                ensure_meta(timestamp, current_cwd, current_model)
+                turns_by_snapshot[message_id] = {
+                    "provider": provider,
+                    "session_id": session_id,
+                    "timestamp": timestamp,
+                    "model": current_model or "unknown",
+                    "input_tokens": uncached_input,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cached_input,
+                    "cache_creation_tokens": 0,
+                    "tool_name": "token_count",
+                    "cwd": current_cwd,
+                    "message_id": message_id,
+                }
+
+    except Exception as e:
+        print(f"  Warning: error reading {filepath}: {e}")
+
+    return list(session_meta.values()), list(turns_by_snapshot.values()), line_count
 
 
 def aggregate_sessions(session_metas, turns):
@@ -235,7 +399,6 @@ def aggregate_sessions(session_metas, turns):
         if counts:
             session_stats[sid]["model"] = counts.most_common(1)[0][0]
 
-    # Merge into session_metas
     result = []
     for meta in session_metas:
         sid = meta["session_id"]
@@ -246,7 +409,7 @@ def aggregate_sessions(session_metas, turns):
 
 def upsert_sessions(conn, sessions):
     for s in sessions:
-        # Check if session exists
+        provider = s.get("provider") or "claude"
         existing = conn.execute(
             "SELECT total_input_tokens, total_output_tokens, total_cache_read, "
             "total_cache_creation, turn_count FROM sessions WHERE session_id = ?",
@@ -256,32 +419,27 @@ def upsert_sessions(conn, sessions):
         if existing is None:
             conn.execute("""
                 INSERT INTO sessions
-                    (session_id, project_name, first_timestamp, last_timestamp,
+                    (session_id, provider, project_name, first_timestamp, last_timestamp,
                      git_branch, total_input_tokens, total_output_tokens,
                      total_cache_read, total_cache_creation, model, turn_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                s["session_id"], s["project_name"], s["first_timestamp"],
+                s["session_id"], provider, s["project_name"], s["first_timestamp"],
                 s["last_timestamp"], s["git_branch"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
                 s["model"], s["turn_count"]
             ))
         else:
-            # Update: add new tokens on top of existing (since we only insert new turns)
-            # Keep the highest-priority model (e.g. opus over haiku from subagents)
             existing_model = conn.execute(
                 "SELECT model FROM sessions WHERE session_id = ?",
                 (s["session_id"],)
             ).fetchone()["model"]
-            new_model = s["model"]
-            if _model_priority(new_model) > _model_priority(existing_model):
-                model_to_set = new_model
-            else:
-                model_to_set = existing_model
+            model_to_set = _choose_session_model(existing_model, s.get("model"))
 
             conn.execute("""
                 UPDATE sessions SET
+                    provider = COALESCE(NULLIF(provider, ''), ?),
                     last_timestamp = MAX(last_timestamp, ?),
                     total_input_tokens = total_input_tokens + ?,
                     total_output_tokens = total_output_tokens + ?,
@@ -291,6 +449,7 @@ def upsert_sessions(conn, sessions):
                     model = ?
                 WHERE session_id = ?
             """, (
+                provider,
                 s["last_timestamp"],
                 s["total_input_tokens"], s["total_output_tokens"],
                 s["total_cache_read"], s["total_cache_creation"],
@@ -302,37 +461,57 @@ def upsert_sessions(conn, sessions):
 def insert_turns(conn, turns):
     conn.executemany("""
         INSERT OR IGNORE INTO turns
-            (session_id, timestamp, model, input_tokens, output_tokens,
+            (provider, session_id, timestamp, model, input_tokens, output_tokens,
              cache_read_tokens, cache_creation_tokens, tool_name, cwd, message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, [
-        (t["session_id"], t["timestamp"], t["model"],
+        (t.get("provider") or "claude", t["session_id"], t["timestamp"], t["model"],
          t["input_tokens"], t["output_tokens"],
          t["cache_read_tokens"], t["cache_creation_tokens"],
-         t["tool_name"], t["cwd"], t.get("message_id", ""))
+         t.get("tool_name"), t.get("cwd"), t.get("message_id", ""))
         for t in turns
     ])
 
 
-def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
+def _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir, codex_sessions_dirs):
+    has_claude_args = projects_dir is not None or projects_dirs is not None
+    has_codex_args = codex_sessions_dir is not None or codex_sessions_dirs is not None
+
+    if not has_claude_args and not has_codex_args:
+        claude_dirs = DEFAULT_PROJECTS_DIRS
+        codex_dirs = DEFAULT_CODEX_SESSIONS_DIRS
+    else:
+        if projects_dirs is not None:
+            claude_dirs = [Path(d) for d in projects_dirs]
+        elif projects_dir is not None:
+            claude_dirs = [Path(projects_dir)]
+        else:
+            claude_dirs = []
+
+        if codex_sessions_dirs is not None:
+            codex_dirs = [Path(d) for d in codex_sessions_dirs]
+        elif codex_sessions_dir is not None:
+            codex_dirs = [Path(codex_sessions_dir)]
+        else:
+            codex_dirs = []
+
+    return [("claude", d) for d in claude_dirs] + [("codex", d) for d in codex_dirs]
+
+
+def scan(projects_dir=None, projects_dirs=None, codex_sessions_dir=None,
+         codex_sessions_dirs=None, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
 
-    if projects_dirs:
-        dirs_to_scan = [Path(d) for d in projects_dirs]
-    elif projects_dir:
-        dirs_to_scan = [Path(projects_dir)]
-    else:
-        dirs_to_scan = DEFAULT_PROJECTS_DIRS
-
+    scan_dirs = _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir, codex_sessions_dirs)
     jsonl_files = []
-    for d in dirs_to_scan:
+    for provider, d in scan_dirs:
         if not d.exists():
             continue
         if verbose:
-            print(f"Scanning {d} ...")
-        jsonl_files.extend(glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
-    jsonl_files.sort()
+            print(f"Scanning {provider}: {d} ...")
+        jsonl_files.extend((provider, p) for p in glob.glob(str(d / "**" / "*.jsonl"), recursive=True))
+    jsonl_files.sort(key=lambda item: item[1])
 
     new_files = 0
     updated_files = 0
@@ -340,7 +519,7 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
     total_turns = 0
     total_sessions = set()
 
-    for filepath in jsonl_files:
+    for provider, filepath in jsonl_files:
         try:
             mtime = os.path.getmtime(filepath)
         except OSError:
@@ -360,146 +539,65 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
             status = "NEW" if is_new else "UPD"
             print(f"  [{status}] {filepath}")
 
-        if is_new:
-            # New file: full parse (single read, returns line count)
-            session_metas, turns, line_count = parse_jsonl_file(filepath)
+        start_line = 0 if is_new else (row["lines"] if row else 0)
+        session_metas, turns, line_count = parse_jsonl_file(
+            filepath, provider=provider, start_line=start_line
+        )
 
-            if turns or session_metas:
-                sessions = aggregate_sessions(session_metas, turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(turns)
+        if not is_new and line_count <= start_line:
+            conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?", (mtime, filepath))
+            conn.commit()
+            skipped_files += 1
+            continue
+
+        if turns or session_metas:
+            sessions = aggregate_sessions(session_metas, turns)
+            upsert_sessions(conn, sessions)
+            insert_turns(conn, turns)
+            for s in sessions:
+                total_sessions.add((s.get("provider") or provider, s["session_id"]))
+            total_turns += len(turns)
+            if is_new:
                 new_files += 1
+            else:
+                updated_files += 1
 
-        else:
-            # Updated file: read once, process only new lines
-            old_lines = row["lines"] if row else 0
-            seen_messages = {}  # message_id -> turn (dedup streaming)
-            turns_no_id = []
-            new_session_metas = {}
-            line_count = 0
-
-            try:
-                with open(filepath, encoding="utf-8", errors="replace") as f:
-                    for line_count, line in enumerate(f, 1):
-                        if line_count <= old_lines:
-                            continue
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            record = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        rtype = record.get("type")
-                        if rtype not in ("assistant", "user"):
-                            continue
-
-                        session_id = record.get("sessionId")
-                        if not session_id:
-                            continue
-
-                        timestamp = record.get("timestamp", "")
-                        cwd = record.get("cwd", "")
-
-                        # Track session metadata from new lines
-                        if session_id not in new_session_metas:
-                            new_session_metas[session_id] = {
-                                "session_id": session_id,
-                                "project_name": project_name_from_cwd(cwd),
-                                "first_timestamp": timestamp,
-                                "last_timestamp": timestamp,
-                                "git_branch": record.get("gitBranch", ""),
-                                "model": None,
-                            }
-                        else:
-                            meta = new_session_metas[session_id]
-                            if timestamp and (not meta["last_timestamp"] or timestamp > meta["last_timestamp"]):
-                                meta["last_timestamp"] = timestamp
-
-                        if rtype == "assistant":
-                            msg = record.get("message", {})
-                            usage = msg.get("usage", {})
-                            model = msg.get("model", "")
-                            message_id = msg.get("id", "")
-
-                            input_tokens = usage.get("input_tokens", 0) or 0
-                            output_tokens = usage.get("output_tokens", 0) or 0
-                            cache_read = usage.get("cache_read_input_tokens", 0) or 0
-                            cache_creation = usage.get("cache_creation_input_tokens", 0) or 0
-
-                            if input_tokens + output_tokens + cache_read + cache_creation == 0:
-                                continue
-
-                            tool_name = None
-                            for item in msg.get("content", []):
-                                if isinstance(item, dict) and item.get("type") == "tool_use":
-                                    tool_name = item.get("name")
-                                    break
-
-                            if model:
-                                new_session_metas[session_id]["model"] = model
-
-                            turn = {
-                                "session_id": session_id,
-                                "timestamp": timestamp,
-                                "model": model,
-                                "input_tokens": input_tokens,
-                                "output_tokens": output_tokens,
-                                "cache_read_tokens": cache_read,
-                                "cache_creation_tokens": cache_creation,
-                                "tool_name": tool_name,
-                                "cwd": cwd,
-                                "message_id": message_id,
-                            }
-
-                            if message_id:
-                                seen_messages[message_id] = turn
-                            else:
-                                turns_no_id.append(turn)
-            except Exception as e:
-                print(f"  Warning: {e}")
-
-            if line_count <= old_lines:
-                # File didn't grow (mtime changed but no new content)
-                conn.execute("UPDATE processed_files SET mtime = ? WHERE path = ?",
-                             (mtime, filepath))
-                conn.commit()
-                skipped_files += 1
-                continue
-
-            new_turns = turns_no_id + list(seen_messages.values())
-
-            if new_turns or new_session_metas:
-                sessions = aggregate_sessions(list(new_session_metas.values()), new_turns)
-                upsert_sessions(conn, sessions)
-                insert_turns(conn, new_turns)
-                for s in sessions:
-                    total_sessions.add(s["session_id"])
-                total_turns += len(new_turns)
-            updated_files += 1
-
-        # Record file as processed (line_count already known from the single read)
         conn.execute("""
             INSERT OR REPLACE INTO processed_files (path, mtime, lines)
             VALUES (?, ?, ?)
         """, (filepath, mtime, line_count))
         conn.commit()
 
-    # Recompute session totals from actual turns in DB.
-    # This ensures correctness when INSERT OR IGNORE skips duplicate turns
-    # but upsert_sessions had already added their tokens additively.
+    # Recompute session totals from actual turns in DB. This keeps totals correct
+    # when INSERT OR REPLACE updates duplicate message IDs.
     if new_files or updated_files:
         conn.execute("""
             UPDATE sessions SET
-                total_input_tokens = COALESCE((SELECT SUM(input_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_output_tokens = COALESCE((SELECT SUM(output_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_read = COALESCE((SELECT SUM(cache_read_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                total_cache_creation = COALESCE((SELECT SUM(cache_creation_tokens) FROM turns WHERE turns.session_id = sessions.session_id), 0),
-                turn_count = COALESCE((SELECT COUNT(*) FROM turns WHERE turns.session_id = sessions.session_id), 0)
+                total_input_tokens = COALESCE((
+                    SELECT SUM(input_tokens) FROM turns
+                    WHERE turns.session_id = sessions.session_id
+                      AND COALESCE(turns.provider, 'claude') = COALESCE(sessions.provider, 'claude')
+                ), 0),
+                total_output_tokens = COALESCE((
+                    SELECT SUM(output_tokens) FROM turns
+                    WHERE turns.session_id = sessions.session_id
+                      AND COALESCE(turns.provider, 'claude') = COALESCE(sessions.provider, 'claude')
+                ), 0),
+                total_cache_read = COALESCE((
+                    SELECT SUM(cache_read_tokens) FROM turns
+                    WHERE turns.session_id = sessions.session_id
+                      AND COALESCE(turns.provider, 'claude') = COALESCE(sessions.provider, 'claude')
+                ), 0),
+                total_cache_creation = COALESCE((
+                    SELECT SUM(cache_creation_tokens) FROM turns
+                    WHERE turns.session_id = sessions.session_id
+                      AND COALESCE(turns.provider, 'claude') = COALESCE(sessions.provider, 'claude')
+                ), 0),
+                turn_count = COALESCE((
+                    SELECT COUNT(*) FROM turns
+                    WHERE turns.session_id = sessions.session_id
+                      AND COALESCE(turns.provider, 'claude') = COALESCE(sessions.provider, 'claude')
+                ), 0)
         """)
         conn.commit()
 
@@ -512,15 +610,23 @@ def scan(projects_dir=None, projects_dirs=None, db_path=DB_PATH, verbose=True):
         print(f"  Sessions seen: {len(total_sessions)}")
 
     conn.close()
-    return {"new": new_files, "updated": updated_files, "skipped": skipped_files,
-            "turns": total_turns, "sessions": len(total_sessions)}
+    return {
+        "new": new_files,
+        "updated": updated_files,
+        "skipped": skipped_files,
+        "turns": total_turns,
+        "sessions": len(total_sessions),
+    }
 
 
 if __name__ == "__main__":
     import sys
     projects_dir = None
-    for i, arg in enumerate(sys.argv[1:]):
-        if arg == "--projects-dir" and i + 1 < len(sys.argv[1:]):
-            projects_dir = Path(sys.argv[i + 2])
-            break
-    scan(projects_dir=projects_dir)
+    codex_sessions_dir = None
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--projects-dir" and i + 1 < len(args):
+            projects_dir = Path(args[i + 1])
+        if arg == "--codex-sessions-dir" and i + 1 < len(args):
+            codex_sessions_dir = Path(args[i + 1])
+    scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir)
