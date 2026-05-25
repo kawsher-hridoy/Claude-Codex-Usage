@@ -61,6 +61,7 @@ class TestGetDashboardData(unittest.TestCase):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertIn("all_providers", data)
         self.assertIn("all_models", data)
+        self.assertIn("all_projects", data)
         self.assertIn("daily_by_model", data)
         self.assertIn("sessions_all", data)
         self.assertIn("generated_at", data)
@@ -69,6 +70,10 @@ class TestGetDashboardData(unittest.TestCase):
         data = get_dashboard_data(db_path=self.db_path)
         self.assertIn("claude", data["all_providers"])
         self.assertIn({"provider": "claude", "model": "claude-sonnet-4-6"}, data["all_models"])
+
+    def test_projects_populated(self):
+        data = get_dashboard_data(db_path=self.db_path)
+        self.assertIn("user/myproject", data["all_projects"])
 
     def test_sessions_populated(self):
         data = get_dashboard_data(db_path=self.db_path)
@@ -86,7 +91,9 @@ class TestGetDashboardData(unittest.TestCase):
         self.assertIn("day", day)
         self.assertIn("provider", day)
         self.assertIn("model", day)
+        self.assertIn("project", day)
         self.assertIn("input", day)
+        self.assertEqual(day["project"], "user/myproject")
 
     def test_missing_db_returns_error(self):
         data = get_dashboard_data(db_path=Path("/nonexistent/path/usage.db"))
@@ -123,8 +130,9 @@ class TestGetDashboardData(unittest.TestCase):
     def test_hourly_by_model_carries_day_and_model(self):
         data = get_dashboard_data(db_path=self.db_path)
         rows = data["hourly_by_model"]
-        self.assertTrue(all("day" in r and "provider" in r and "model" in r for r in rows))
+        self.assertTrue(all("day" in r and "provider" in r and "model" in r and "project" in r for r in rows))
         self.assertTrue(all(r["model"] == "claude-sonnet-4-6" for r in rows))
+        self.assertTrue(all(r["project"] == "user/myproject" for r in rows))
         self.assertTrue(all(r["day"] == "2026-04-08" for r in rows))
 
 
@@ -230,6 +238,11 @@ class TestHTMLTemplate(unittest.TestCase):
         self.assertIn('id="provider-checkboxes"', HTML_TEMPLATE)
         self.assertIn('function readURLProviders', HTML_TEMPLATE)
         self.assertIn('modelKey(provider, model)', HTML_TEMPLATE)
+
+    def test_project_filter_present(self):
+        self.assertIn('id="project-select"', HTML_TEMPLATE)
+        self.assertIn('function readURLProject', HTML_TEMPLATE)
+        self.assertIn('projectMatches(r.project)', HTML_TEMPLATE)
 
     def test_hourly_chart_canvas_present(self):
         """Hourly distribution chart has a canvas + TZ toggle."""

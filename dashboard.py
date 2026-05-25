@@ -43,26 +43,39 @@ def get_dashboard_data(db_path=DB_PATH):
     """).fetchall()
     all_models = [{"provider": r["provider"], "model": r["model"]} for r in model_rows]
 
-    # ── Daily per-model, ALL history (client filters by range) ────────────────
+    project_rows = conn.execute("""
+        SELECT COALESCE(project_name, 'unknown') as project
+        FROM sessions
+        GROUP BY COALESCE(project_name, 'unknown')
+        ORDER BY project
+    """).fetchall()
+    all_projects = [r["project"] for r in project_rows]
+
+    # ── Daily per-model/project, ALL history (client filters by range) ────────
     daily_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)     as day,
-            COALESCE(provider, 'claude') as provider,
-            COALESCE(model, 'unknown')   as model,
-            SUM(input_tokens)          as input,
-            SUM(output_tokens)         as output,
-            SUM(cache_read_tokens)     as cache_read,
-            SUM(cache_creation_tokens) as cache_creation,
-            COUNT(*)                   as turns
-        FROM turns
-        GROUP BY day, COALESCE(provider, 'claude'), COALESCE(model, 'unknown')
-        ORDER BY day, provider, model
+            substr(t.timestamp, 1, 10)          as day,
+            COALESCE(t.provider, 'claude')      as provider,
+            COALESCE(t.model, 'unknown')        as model,
+            COALESCE(s.project_name, 'unknown') as project,
+            SUM(t.input_tokens)                 as input,
+            SUM(t.output_tokens)                as output,
+            SUM(t.cache_read_tokens)            as cache_read,
+            SUM(t.cache_creation_tokens)        as cache_creation,
+            COUNT(*)                            as turns
+        FROM turns t
+        LEFT JOIN sessions s
+          ON t.session_id = s.session_id
+         AND COALESCE(t.provider, 'claude') = COALESCE(s.provider, 'claude')
+        GROUP BY 1, 2, 3, 4
+        ORDER BY 1, 2, 3, 4
     """).fetchall()
 
     daily_by_model = [{
         "day":            r["day"],
         "provider":       r["provider"],
         "model":          r["model"],
+        "project":        r["project"],
         "input":          r["input"] or 0,
         "output":         r["output"] or 0,
         "cache_read":     r["cache_read"] or 0,
@@ -70,20 +83,24 @@ def get_dashboard_data(db_path=DB_PATH):
         "turns":          r["turns"] or 0,
     } for r in daily_rows]
 
-    # ── Hourly per-day per-model (client filters by range + TZ-shifts) ────────
+    # ── Hourly per-day per-model/project (client filters by range + TZ-shifts) ─
     # Timestamps are ISO8601 UTC (e.g. "2026-04-08T09:30:00Z"); chars 12-13 = hour.
     hourly_rows = conn.execute("""
         SELECT
-            substr(timestamp, 1, 10)                  as day,
-            CAST(substr(timestamp, 12, 2) AS INTEGER) as hour,
-            COALESCE(provider, 'claude')              as provider,
-            COALESCE(model, 'unknown')                as model,
-            SUM(output_tokens)                        as output,
-            COUNT(*)                                  as turns
-        FROM turns
-        WHERE timestamp IS NOT NULL AND length(timestamp) >= 13
-        GROUP BY day, hour, COALESCE(provider, 'claude'), COALESCE(model, 'unknown')
-        ORDER BY day, hour, provider, model
+            substr(t.timestamp, 1, 10)                  as day,
+            CAST(substr(t.timestamp, 12, 2) AS INTEGER) as hour,
+            COALESCE(t.provider, 'claude')              as provider,
+            COALESCE(t.model, 'unknown')                as model,
+            COALESCE(s.project_name, 'unknown')         as project,
+            SUM(t.output_tokens)                        as output,
+            COUNT(*)                                    as turns
+        FROM turns t
+        LEFT JOIN sessions s
+          ON t.session_id = s.session_id
+         AND COALESCE(t.provider, 'claude') = COALESCE(s.provider, 'claude')
+        WHERE t.timestamp IS NOT NULL AND length(t.timestamp) >= 13
+        GROUP BY 1, 2, 3, 4, 5
+        ORDER BY 1, 2, 3, 4, 5
     """).fetchall()
 
     hourly_by_model = [{
@@ -91,6 +108,7 @@ def get_dashboard_data(db_path=DB_PATH):
         "hour":   r["hour"] if r["hour"] is not None else 0,
         "provider": r["provider"],
         "model":  r["model"],
+        "project": r["project"],
         "output": r["output"] or 0,
         "turns":  r["turns"] or 0,
     } for r in hourly_rows]
@@ -135,6 +153,7 @@ def get_dashboard_data(db_path=DB_PATH):
     return {
         "all_providers":   all_providers,
         "all_models":      all_models,
+        "all_projects":    all_projects,
         "daily_by_model":  daily_by_model,
         "hourly_by_model": hourly_by_model,
         "sessions_all":    sessions_all,
@@ -178,6 +197,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .provider-cb-label:hover, .model-cb-label:hover { border-color: var(--accent); color: var(--text); }
   .provider-cb-label.checked, .model-cb-label.checked { background: rgba(217,119,87,0.12); border-color: var(--accent); color: var(--text); }
   .provider-cb-label input, .model-cb-label input { display: none; }
+  .filter-select { max-width: 260px; min-width: 190px; background: var(--card); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 4px 9px; font-size: 12px; }
+  .filter-select:focus { outline: none; border-color: var(--accent); }
   .filter-btn { padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 11px; cursor: pointer; white-space: nowrap; }
   .filter-btn:hover { border-color: var(--accent); color: var(--text); }
   .range-group { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; flex-shrink: 0; }
@@ -257,6 +278,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="model-checkboxes"></div>
   <button class="filter-btn" onclick="selectAllModels()">All</button>
   <button class="filter-btn" onclick="clearAllModels()">None</button>
+  <div class="filter-sep"></div>
+  <div class="filter-label">Project / Folder</div>
+  <select class="filter-select" id="project-select" onchange="onProjectChange(this)"></select>
   <div class="filter-sep"></div>
   <div class="filter-label">Range</div>
   <div class="range-group">
@@ -392,6 +416,7 @@ function esc(s) {
 let rawData = null;
 let selectedProviders = new Set();
 let selectedModels = new Set();
+let selectedProject = '';
 let selectedRange = '30d';
 let charts = {};
 let sessionSortCol = 'last';
@@ -622,6 +647,16 @@ function readURLModels(allModels) {
   return new Set(keys.filter(k => fromURL.has(k)));
 }
 
+function readURLProject(allProjects) {
+  const param = new URLSearchParams(window.location.search).get('project');
+  if (!param) return '';
+  return allProjects.includes(param) ? param : '';
+}
+
+function projectMatches(project) {
+  return !selectedProject || project === selectedProject;
+}
+
 function isDefaultProviderSelection(allProviders) {
   if (selectedProviders.size !== allProviders.length) return false;
   return allProviders.every(p => selectedProviders.has(p));
@@ -633,7 +668,7 @@ function isDefaultModelSelection(allModels) {
   return keys.every(k => selectedModels.has(k));
 }
 
-function buildFilterUI(allProviders, allModels) {
+function buildFilterUI(allProviders, allModels, allProjects) {
   selectedProviders = readURLProviders(allProviders);
   const providerContainer = document.getElementById('provider-checkboxes');
   providerContainer.innerHTML = allProviders.map(p => {
@@ -659,6 +694,21 @@ function buildFilterUI(allProviders, allModels) {
       ${esc(key)}
     </label>`;
   }).join('');
+
+  selectedProject = readURLProject(allProjects || []);
+  const projectSelect = document.getElementById('project-select');
+  const projectOptions = [''].concat(allProjects || []);
+  projectSelect.innerHTML = projectOptions.map(p => {
+    const label = p || 'All Projects';
+    const selected = p === selectedProject ? ' selected' : '';
+    return `<option value="${esc(p)}"${selected}>${esc(label)}</option>`;
+  }).join('');
+}
+
+function onProjectChange(sel) {
+  selectedProject = sel.value;
+  updateURL();
+  applyFilter();
 }
 
 function onProviderToggle(cb) {
@@ -697,6 +747,7 @@ function updateURL() {
   const allModels = (rawData && rawData.all_models) ? rawData.all_models : [];
   const params = new URLSearchParams();
   if (selectedRange !== '30d') params.set('range', selectedRange);
+  if (selectedProject) params.set('project', selectedProject);
   if (!isDefaultProviderSelection(allProviders)) params.set('providers', Array.from(selectedProviders).join(','));
   if (!isDefaultModelSelection(allModels)) params.set('models', Array.from(selectedModels).join(','));
   const search = params.toString() ? '?' + params.toString() : '';
@@ -746,9 +797,9 @@ function applyFilter() {
 
   const { start, end } = getRangeBounds(selectedRange);
 
-  // Filter daily rows by provider + model + date range
+  // Filter daily rows by provider + model + project + date range
   const filteredDaily = rawData.daily_by_model.filter(r =>
-    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && projectMatches(r.project) && (!start || r.day >= start) && (!end || r.day <= end)
   );
 
   // Daily chart: aggregate by day
@@ -776,9 +827,9 @@ function applyFilter() {
     m.turns          += r.turns;
   }
 
-  // Filter sessions by model + date range
+  // Filter sessions by provider + model + project + date range
   const filteredSessions = rawData.sessions_all.filter(s =>
-    selectedProviders.has(s.provider) && selectedModels.has(modelKey(s.provider, s.model)) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
+    selectedProviders.has(s.provider) && selectedModels.has(modelKey(s.provider, s.model)) && projectMatches(s.project) && (!start || s.last_date >= start) && (!end || s.last_date <= end)
   );
 
   // Add session counts into modelMap
@@ -833,9 +884,9 @@ function applyFilter() {
     cost:           byModel.reduce((s, m) => s + calcCost(m.model, m.input, m.output, m.cache_read, m.cache_creation), 0),
   };
 
-  // Hourly aggregation (filtered by model + range, then bucketed by UTC hour)
+  // Hourly aggregation (filtered by provider + model + project + range, then bucketed by UTC hour)
   const hourlySrc = (rawData.hourly_by_model || []).filter(r =>
-    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && (!start || r.day >= start) && (!end || r.day <= end)
+    selectedProviders.has(r.provider) && selectedModels.has(modelKey(r.provider, r.model)) && projectMatches(r.project) && (!start || r.day >= start) && (!end || r.day <= end)
   );
   const hourlyAgg = aggregateHourly(hourlySrc, hourlyTZ);
 
@@ -1309,8 +1360,8 @@ async function loadData() {
       document.querySelectorAll('.tz-btn').forEach(btn =>
         btn.classList.toggle('active', btn.dataset.tz === hourlyTZ)
       );
-      // Build model filter (reads URL for model selection too)
-      buildFilterUI(d.all_providers || ['claude'], d.all_models);
+      // Build filter controls (reads URL for project/model selection too)
+      buildFilterUI(d.all_providers || ['claude'], d.all_models, d.all_projects || []);
       updateSortIcons();
       updateModelSortIcons();
       updateProjectSortIcons();
