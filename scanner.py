@@ -16,7 +16,7 @@ DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 DEFAULT_CODEX_SESSIONS_DIRS = [CODEX_SESSIONS_DIR]
 
 # Higher number = higher priority when choosing a Claude session's primary model.
-MODEL_PRIORITY = {"opus": 3, "sonnet": 2, "haiku": 1}
+MODEL_PRIORITY = {"fable": 4, "opus": 3, "sonnet": 2, "haiku": 1}
 
 
 def _model_priority(model):
