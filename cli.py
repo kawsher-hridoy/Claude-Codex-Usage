@@ -105,11 +105,12 @@ def require_db():
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
-def cmd_scan(projects_dir=None, codex_sessions_dir=None):
+def cmd_scan(projects_dir=None, codex_sessions_dir=None, cowork_sessions_dir=None):
     from scanner import scan
     scan(
         projects_dir=Path(projects_dir) if projects_dir else None,
         codex_sessions_dir=Path(codex_sessions_dir) if codex_sessions_dir else None,
+        cowork_sessions_dir=Path(cowork_sessions_dir) if cowork_sessions_dir else None,
     )
 
 
@@ -397,13 +398,14 @@ def cmd_stats():
     conn.close()
 
 
-def cmd_dashboard(projects_dir=None, codex_sessions_dir=None, host=None, port=None):
+def cmd_dashboard(projects_dir=None, codex_sessions_dir=None, cowork_sessions_dir=None, host=None, port=None):
     import webbrowser
     import threading
     import time
 
     print("Running scan first...")
-    cmd_scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir)
+    cmd_scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir,
+             cowork_sessions_dir=cowork_sessions_dir)
 
     print("\nStarting dashboard server...")
     from dashboard import serve
@@ -413,7 +415,22 @@ def cmd_dashboard(projects_dir=None, codex_sessions_dir=None, host=None, port=No
 
     def open_browser():
         time.sleep(1.0)
-        webbrowser.open(f"http://{host}:{port}")
+        url = f"http://{host}:{port}"
+        # Launch the browser with stdout/stderr redirected to /dev/null so its
+        # extension/GPU/Fontconfig warnings don't pollute the dashboard console.
+        # The browser subprocess inherits the redirected fds; we restore ours after.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        saved_out, saved_err = os.dup(1), os.dup(2)
+        try:
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            webbrowser.open(url)
+        finally:
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            os.close(devnull)
+            os.close(saved_out)
+            os.close(saved_err)
 
     t = threading.Thread(target=open_browser, daemon=True)
     t.start()
@@ -426,12 +443,12 @@ USAGE = """
 Claude Code Usage Dashboard
 
 Usage:
-  python cli.py scan [--projects-dir PATH] [--codex-sessions-dir PATH]
-                                                Scan Claude + Codex JSONL files and update database
+  python cli.py scan [--projects-dir PATH] [--codex-sessions-dir PATH] [--cowork-sessions-dir PATH]
+                                                Scan Claude + Codex + Cowork JSONL files and update database
   python cli.py today                        Show today's usage summary
   python cli.py week                         Show last 7 days (per-day + by-model)
   python cli.py stats                        Show all-time statistics
-  python cli.py dashboard [--projects-dir PATH] [--codex-sessions-dir PATH] [--host HOST] [--port PORT]
+  python cli.py dashboard [--projects-dir PATH] [--codex-sessions-dir PATH] [--cowork-sessions-dir PATH] [--host HOST] [--port PORT]
                                                  Scan + start dashboard
 """
 
@@ -459,15 +476,18 @@ if __name__ == "__main__":
     rest = sys.argv[2:]
     projects_dir = parse_named_arg(rest, "--projects-dir")
     codex_sessions_dir = parse_named_arg(rest, "--codex-sessions-dir")
+    cowork_sessions_dir = parse_named_arg(rest, "--cowork-sessions-dir")
 
     if command == "dashboard":
         cmd_dashboard(
             projects_dir=projects_dir,
             codex_sessions_dir=codex_sessions_dir,
+            cowork_sessions_dir=cowork_sessions_dir,
             host=parse_named_arg(rest, "--host"),
             port=parse_named_arg(rest, "--port"),
         )
-    elif command == "scan" and (projects_dir or codex_sessions_dir):
-        cmd_scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir)
+    elif command == "scan" and (projects_dir or codex_sessions_dir or cowork_sessions_dir):
+        cmd_scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir,
+                 cowork_sessions_dir=cowork_sessions_dir)
     else:
         COMMANDS[command]()

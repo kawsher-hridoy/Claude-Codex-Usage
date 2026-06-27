@@ -1,5 +1,5 @@
 """
-scanner.py - Scans Claude Code and Codex JSONL transcript files into SQLite.
+scanner.py - Scans Claude Code, Codex, and Cowork JSONL transcript files into SQLite.
 """
 
 import json
@@ -12,8 +12,21 @@ PROJECTS_DIR = Path.home() / ".claude" / "projects"
 XCODE_PROJECTS_DIR = Path.home() / "Library" / "Developer" / "Xcode" / "CodingAssistant" / "ClaudeAgentConfig" / "projects"
 CODEX_SESSIONS_DIR = Path.home() / ".codex" / "sessions"
 DB_PATH = Path.home() / ".claude" / "usage.db"
+
+# Cowork (the Claude desktop "local agent mode") writes per-session audit logs.
+# The desktop app stores them under its config dir; "Claude-3p" is the
+# custom-endpoint / third-party build that also runs locally. macOS keeps the
+# same tree under "Application Support".
+COWORK_SESSIONS_DIRS = [
+    Path.home() / ".config" / "Claude" / "local-agent-mode-sessions",
+    Path.home() / ".config" / "Claude-3p" / "local-agent-mode-sessions",
+    Path.home() / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions",
+    Path.home() / "Library" / "Application Support" / "Claude-3p" / "local-agent-mode-sessions",
+]
+
 DEFAULT_PROJECTS_DIRS = [PROJECTS_DIR, XCODE_PROJECTS_DIR]
 DEFAULT_CODEX_SESSIONS_DIRS = [CODEX_SESSIONS_DIR]
+DEFAULT_COWORK_SESSIONS_DIRS = list(COWORK_SESSIONS_DIRS)
 
 # Higher number = higher priority when choosing a Claude session's primary model.
 MODEL_PRIORITY = {"fable": 4, "opus": 3, "sonnet": 2, "haiku": 1}
@@ -160,6 +173,8 @@ def parse_jsonl_file(filepath, provider="claude", start_line=0):
     """Parse a JSONL file and return (session_metas, turns, line_count)."""
     if provider == "codex":
         return parse_codex_jsonl_file(filepath, start_line=start_line)
+    if provider == "cowork":
+        return parse_cowork_jsonl_file(filepath, start_line=start_line)
     return parse_claude_jsonl_file(filepath, start_line=start_line)
 
 
@@ -371,6 +386,133 @@ def parse_codex_jsonl_file(filepath, start_line=0):
     return list(session_meta.values()), list(turns_by_snapshot.values()), line_count
 
 
+def _cowork_session_context(filepath):
+    """Resolve (cwd, project_name) for a Cowork audit.jsonl file.
+
+    Cowork audit records carry token usage but no cwd/title. That metadata lives
+    in the sibling ``local_<id>.json`` next to the ``local_<id>/audit.jsonl``
+    directory, so we read it once per file to label the session.
+    """
+    audit_dir = Path(filepath).parent
+    sibling = audit_dir.parent / (audit_dir.name + ".json")
+    cwd = ""
+    project_name = "cowork"
+    try:
+        with open(sibling, encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+        cwd = data.get("cwd") or ""
+        folders = data.get("userSelectedFolders") or []
+        title = (data.get("title") or "").strip()
+        if folders:
+            project_name = project_name_from_cwd(folders[0])
+        elif title and title.lower() != "new session":
+            project_name = title
+    except (OSError, json.JSONDecodeError):
+        pass
+    return cwd, project_name
+
+
+def parse_cowork_jsonl_file(filepath, start_line=0):
+    """Parse a Cowork (Claude desktop local agent mode) audit.jsonl transcript.
+
+    Audit records use the same ``message.usage`` token fields as Claude Code, but
+    timestamps come from ``_audit_timestamp`` and the cwd/title live in a sibling
+    session JSON. Assistant messages carry a stable ``message.id`` used to dedup
+    streaming events, mirroring the Claude parser.
+    """
+    provider = "cowork"
+    cwd, project_name = _cowork_session_context(filepath)
+    seen_messages = {}
+    turns_no_id = []
+    session_meta = {}
+    line_count = 0
+
+    def ensure_meta(session_id, timestamp, model=None):
+        # Only register sessions that carry real usage. Cowork keys some early
+        # user/system records under a throwaway session id (the file's own uuid),
+        # so registering meta for non-billable records would create empty
+        # 0-turn sessions in the dashboard.
+        if session_id not in session_meta:
+            meta = _new_session_meta(session_id, provider, timestamp, cwd, "", model)
+            meta["project_name"] = project_name
+            session_meta[session_id] = meta
+        else:
+            _update_meta(session_meta[session_id], timestamp, "", "", model)
+        return session_meta[session_id]
+
+    try:
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for line_count, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if line_count <= start_line:
+                    continue
+
+                if record.get("type") != "assistant":
+                    continue
+
+                raw_session_id = record.get("session_id")
+                if not raw_session_id:
+                    continue
+                session_id = "cowork:" + raw_session_id
+
+                timestamp = record.get("_audit_timestamp", "")
+
+                msg = record.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+                usage = msg.get("usage", {}) or {}
+                model = msg.get("model", "")
+                raw_message_id = msg.get("id", "")
+                message_id = ("cowork:" + raw_message_id) if raw_message_id else ""
+
+                input_tokens = _int(usage.get("input_tokens"))
+                output_tokens = _int(usage.get("output_tokens"))
+                cache_read = _int(usage.get("cache_read_input_tokens"))
+                cache_creation = _int(usage.get("cache_creation_input_tokens"))
+
+                if input_tokens + output_tokens + cache_read + cache_creation == 0:
+                    continue
+
+                tool_name = None
+                for item in msg.get("content", []):
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        tool_name = item.get("name")
+                        break
+
+                ensure_meta(session_id, timestamp, model)
+
+                turn = {
+                    "provider": provider,
+                    "session_id": session_id,
+                    "timestamp": timestamp,
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cache_read_tokens": cache_read,
+                    "cache_creation_tokens": cache_creation,
+                    "tool_name": tool_name,
+                    "cwd": cwd,
+                    "message_id": message_id,
+                }
+
+                if message_id:
+                    seen_messages[message_id] = turn
+                else:
+                    turns_no_id.append(turn)
+
+    except Exception as e:
+        print(f"  Warning: error reading {filepath}: {e}")
+
+    return list(session_meta.values()), turns_no_id + list(seen_messages.values()), line_count
+
+
 def aggregate_sessions(session_metas, turns):
     """Aggregate turn data back into session-level stats."""
     from collections import defaultdict, Counter
@@ -473,13 +615,17 @@ def insert_turns(conn, turns):
     ])
 
 
-def _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir, codex_sessions_dirs):
+def _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir,
+                        codex_sessions_dirs, cowork_sessions_dir=None,
+                        cowork_sessions_dirs=None):
     has_claude_args = projects_dir is not None or projects_dirs is not None
     has_codex_args = codex_sessions_dir is not None or codex_sessions_dirs is not None
+    has_cowork_args = cowork_sessions_dir is not None or cowork_sessions_dirs is not None
 
-    if not has_claude_args and not has_codex_args:
+    if not has_claude_args and not has_codex_args and not has_cowork_args:
         claude_dirs = DEFAULT_PROJECTS_DIRS
         codex_dirs = DEFAULT_CODEX_SESSIONS_DIRS
+        cowork_dirs = DEFAULT_COWORK_SESSIONS_DIRS
     else:
         if projects_dirs is not None:
             claude_dirs = [Path(d) for d in projects_dirs]
@@ -495,15 +641,30 @@ def _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir, codex_s
         else:
             codex_dirs = []
 
-    return [("claude", d) for d in claude_dirs] + [("codex", d) for d in codex_dirs]
+        if cowork_sessions_dirs is not None:
+            cowork_dirs = [Path(d) for d in cowork_sessions_dirs]
+        elif cowork_sessions_dir is not None:
+            cowork_dirs = [Path(cowork_sessions_dir)]
+        else:
+            cowork_dirs = []
+
+    return (
+        [("claude", d) for d in claude_dirs]
+        + [("codex", d) for d in codex_dirs]
+        + [("cowork", d) for d in cowork_dirs]
+    )
 
 
 def scan(projects_dir=None, projects_dirs=None, codex_sessions_dir=None,
-         codex_sessions_dirs=None, db_path=DB_PATH, verbose=True):
+         codex_sessions_dirs=None, cowork_sessions_dir=None,
+         cowork_sessions_dirs=None, db_path=DB_PATH, verbose=True):
     conn = get_db(db_path)
     init_db(conn)
 
-    scan_dirs = _scan_dirs_for_args(projects_dir, projects_dirs, codex_sessions_dir, codex_sessions_dirs)
+    scan_dirs = _scan_dirs_for_args(
+        projects_dir, projects_dirs, codex_sessions_dir, codex_sessions_dirs,
+        cowork_sessions_dir, cowork_sessions_dirs,
+    )
     jsonl_files = []
     for provider, d in scan_dirs:
         if not d.exists():
@@ -623,10 +784,14 @@ if __name__ == "__main__":
     import sys
     projects_dir = None
     codex_sessions_dir = None
+    cowork_sessions_dir = None
     args = sys.argv[1:]
     for i, arg in enumerate(args):
         if arg == "--projects-dir" and i + 1 < len(args):
             projects_dir = Path(args[i + 1])
         if arg == "--codex-sessions-dir" and i + 1 < len(args):
             codex_sessions_dir = Path(args[i + 1])
-    scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir)
+        if arg == "--cowork-sessions-dir" and i + 1 < len(args):
+            cowork_sessions_dir = Path(args[i + 1])
+    scan(projects_dir=projects_dir, codex_sessions_dir=codex_sessions_dir,
+         cowork_sessions_dir=cowork_sessions_dir)

@@ -9,7 +9,8 @@ from pathlib import Path
 
 from scanner import (
     get_db, init_db, project_name_from_cwd, parse_jsonl_file,
-    parse_codex_jsonl_file, aggregate_sessions, upsert_sessions, insert_turns, scan,
+    parse_codex_jsonl_file, parse_cowork_jsonl_file,
+    aggregate_sessions, upsert_sessions, insert_turns, scan,
 )
 
 
@@ -106,6 +107,172 @@ def _make_codex_token_count(input_tokens, cached_input_tokens, output_tokens,
             },
         },
     })
+
+
+def _make_cowork_record(rtype="assistant", session_id="cli-sess-1",
+                        model="claude-opus-4-8", input_tokens=10, output_tokens=20,
+                        cache_read=100, cache_creation=50,
+                        timestamp="2026-06-11T21:00:07Z", message_id="msg_abc",
+                        tool_name=None):
+    content = []
+    if tool_name:
+        content.append({"type": "tool_use", "name": tool_name})
+    record = {
+        "type": rtype,
+        "session_id": session_id,
+        "_audit_timestamp": timestamp,
+    }
+    if rtype == "assistant":
+        msg = {
+            "id": message_id,
+            "role": "assistant",
+            "model": model,
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_input_tokens": cache_read,
+                "cache_creation_input_tokens": cache_creation,
+            },
+            "content": content,
+        }
+        record["message"] = msg
+    return json.dumps(record)
+
+
+def _write_cowork_session(base_dir, file_id, audit_lines, cwd=None,
+                          title="New session", user_selected_folders=None):
+    """Create a Cowork session layout: local_<id>.json + local_<id>/audit.jsonl."""
+    session_dir = Path(base_dir) / ("local_" + file_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    sibling = Path(base_dir) / ("local_" + file_id + ".json")
+    sibling.write_text(json.dumps({
+        "sessionId": "local_" + file_id,
+        "cwd": cwd if cwd is not None else str(session_dir / "outputs"),
+        "title": title,
+        "userSelectedFolders": user_selected_folders or [],
+    }))
+    audit = session_dir / "audit.jsonl"
+    with open(audit, "w") as f:
+        for line in audit_lines:
+            f.write(line + "\n")
+    return str(audit)
+
+
+class TestParseCoworkJsonlFile(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def test_basic_parsing(self):
+        path = _write_cowork_session(self.tmpdir, "file-1", [
+            _make_cowork_record(rtype="user", session_id="file-1"),
+            _make_cowork_record(session_id="cli-1", input_tokens=10, output_tokens=20,
+                                cache_read=100, cache_creation=50, message_id="msg_1"),
+        ], user_selected_folders=["/home/user/myproject"])
+
+        metas, turns, line_count = parse_cowork_jsonl_file(path)
+        self.assertEqual(line_count, 2)
+        self.assertEqual(len(metas), 1)
+        self.assertEqual(metas[0]["provider"], "cowork")
+        self.assertEqual(metas[0]["session_id"], "cowork:cli-1")
+        self.assertEqual(metas[0]["project_name"], "user/myproject")
+        self.assertEqual(len(turns), 1)
+        t = turns[0]
+        self.assertEqual(t["provider"], "cowork")
+        self.assertEqual(t["session_id"], "cowork:cli-1")
+        self.assertEqual(t["input_tokens"], 10)
+        self.assertEqual(t["output_tokens"], 20)
+        self.assertEqual(t["cache_read_tokens"], 100)
+        self.assertEqual(t["cache_creation_tokens"], 50)
+        self.assertEqual(t["model"], "claude-opus-4-8")
+        self.assertEqual(t["message_id"], "cowork:msg_1")
+
+    def test_non_billable_records_create_no_session(self):
+        # User/system records under a throwaway session id must not produce
+        # an empty 0-turn session.
+        path = _write_cowork_session(self.tmpdir, "file-2", [
+            _make_cowork_record(rtype="user", session_id="file-2"),
+            _make_cowork_record(session_id="cli-2", message_id="msg_2"),
+        ])
+        metas, turns, _ = parse_cowork_jsonl_file(path)
+        session_ids = {m["session_id"] for m in metas}
+        self.assertEqual(session_ids, {"cowork:cli-2"})
+
+    def test_skips_zero_token_records(self):
+        path = _write_cowork_session(self.tmpdir, "file-3", [
+            _make_cowork_record(session_id="cli-3", input_tokens=0, output_tokens=0,
+                                cache_read=0, cache_creation=0, message_id="msg_3"),
+        ])
+        metas, turns, _ = parse_cowork_jsonl_file(path)
+        self.assertEqual(len(turns), 0)
+        self.assertEqual(len(metas), 0)
+
+    def test_streaming_events_deduped_by_message_id(self):
+        dup = _make_cowork_record(session_id="cli-4", output_tokens=20, message_id="msg_dup")
+        path = _write_cowork_session(self.tmpdir, "file-4", [dup, dup])
+        _, turns, _ = parse_cowork_jsonl_file(path)
+        self.assertEqual(len(turns), 1)
+
+    def test_tool_name_extracted(self):
+        path = _write_cowork_session(self.tmpdir, "file-5", [
+            _make_cowork_record(session_id="cli-5", message_id="msg_5", tool_name="Bash"),
+        ])
+        _, turns, _ = parse_cowork_jsonl_file(path)
+        self.assertEqual(turns[0]["tool_name"], "Bash")
+
+    def test_title_used_when_no_folders(self):
+        path = _write_cowork_session(self.tmpdir, "file-6", [
+            _make_cowork_record(session_id="cli-6", message_id="msg_6"),
+        ], title="Hermes agent research")
+        metas, _, _ = parse_cowork_jsonl_file(path)
+        self.assertEqual(metas[0]["project_name"], "Hermes agent research")
+
+    def test_dispatch_via_parse_jsonl_file(self):
+        path = _write_cowork_session(self.tmpdir, "file-7", [
+            _make_cowork_record(session_id="cli-7", message_id="msg_7"),
+        ])
+        metas, turns, _ = parse_jsonl_file(path, provider="cowork")
+        self.assertEqual(turns[0]["provider"], "cowork")
+
+
+class TestCoworkScanIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.base = Path(self.tmpdir) / "local-agent-mode-sessions"
+        self.base.mkdir(parents=True)
+        self.db_path = Path(self.tmpdir) / "usage.db"
+
+    def test_scan_cowork_sessions_dir(self):
+        _write_cowork_session(str(self.base), "file-1", [
+            _make_cowork_record(rtype="user", session_id="file-1"),
+            _make_cowork_record(session_id="cli-1", input_tokens=10, output_tokens=20,
+                                cache_read=100, cache_creation=50, message_id="msg_1"),
+        ], user_selected_folders=["/home/user/myproject"])
+
+        result = scan(cowork_sessions_dir=self.base, db_path=self.db_path, verbose=False)
+        self.assertEqual(result["new"], 1)
+        self.assertEqual(result["turns"], 1)
+        self.assertEqual(result["sessions"], 1)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT * FROM sessions").fetchone()
+        turn = conn.execute("SELECT * FROM turns").fetchone()
+        conn.close()
+        self.assertEqual(session["provider"], "cowork")
+        self.assertEqual(session["session_id"], "cowork:cli-1")
+        self.assertEqual(session["project_name"], "user/myproject")
+        self.assertEqual(session["total_input_tokens"], 10)
+        self.assertEqual(session["total_cache_read"], 100)
+        self.assertEqual(turn["provider"], "cowork")
+
+    def test_rescan_is_idempotent(self):
+        _write_cowork_session(str(self.base), "file-1", [
+            _make_cowork_record(session_id="cli-1", message_id="msg_1"),
+        ])
+        scan(cowork_sessions_dir=self.base, db_path=self.db_path, verbose=False)
+        result = scan(cowork_sessions_dir=self.base, db_path=self.db_path, verbose=False)
+        self.assertEqual(result["turns"], 0)
+        self.assertEqual(result["new"], 0)
 
 
 class TestParseJsonlFile(unittest.TestCase):

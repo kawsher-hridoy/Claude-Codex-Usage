@@ -133,7 +133,7 @@ def get_dashboard_data(db_path=DB_PATH):
         except Exception:
             duration_min = 0
         sessions_all.append({
-            "session_id":    r["session_id"][6:14] if (r["provider"] == "codex" and r["session_id"].startswith("codex:")) else r["session_id"][:8],
+            "session_id":    r["session_id"][6:14] if (r["provider"] == "codex" and r["session_id"].startswith("codex:")) else (r["session_id"][7:15] if (r["provider"] == "cowork" and r["session_id"].startswith("cowork:")) else r["session_id"][:8]),
             "provider":      r["provider"],
             "project":       r["project_name"] or "unknown",
             "branch":        r["git_branch"] or "",
@@ -1431,6 +1431,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 db_path=db_path,
                 projects_dirs=scanner.DEFAULT_PROJECTS_DIRS,
                 codex_sessions_dirs=scanner.DEFAULT_CODEX_SESSIONS_DIRS,
+                cowork_sessions_dirs=scanner.DEFAULT_COWORK_SESSIONS_DIRS,
                 verbose=False,
             )
             body = json.dumps(result).encode("utf-8")

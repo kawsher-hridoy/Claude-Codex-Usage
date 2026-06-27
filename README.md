@@ -17,16 +17,17 @@ Claude Code and OpenAI Codex both write detailed local usage logs: token counts,
 
 ## What this tracks
 
-Works with local Claude Code and Codex logs. Claude Code writes local usage logs regardless of subscription type, and Codex writes rollout session logs under `~/.codex/sessions/`.
+Works with local Claude Code, Codex, and Cowork logs. Claude Code writes local usage logs regardless of subscription type, Codex writes rollout session logs under `~/.codex/sessions/`, and Cowork (the Claude desktop "local agent mode") writes per-session audit logs under `~/.config/Claude*/local-agent-mode-sessions/`.
 
 Captures usage from:
 - **Claude Code CLI** (`claude` command in terminal)
 - **VS Code extension** (Claude Code sidebar)
 - **Dispatched Code sessions** (sessions routed through Claude Code)
 - **OpenAI Codex CLI** (`~/.codex/sessions/**/*.jsonl`)
+- **Cowork / local agent mode** (Claude desktop app — `local-agent-mode-sessions/**/audit.jsonl`)
 
 **Not captured:**
-- **Cowork sessions** — these run server-side and do not write local JSONL transcripts
+- **Cloud-only Cowork sessions** — Cowork work that runs entirely server-side (not in local agent mode) leaves no local `audit.jsonl`, so it can't be read
 
 ---
 
@@ -86,13 +87,16 @@ python cli.py scan --projects-dir /path/to/claude/transcripts
 # Scan a custom Codex sessions directory
 python cli.py scan --codex-sessions-dir /path/to/codex/sessions
 
-# Scan both custom sources
+# Scan a custom Cowork (local agent mode) sessions directory
+python cli.py scan --cowork-sessions-dir /path/to/local-agent-mode-sessions
+
+# Scan multiple custom sources
 python cli.py scan --projects-dir /path/to/claude/transcripts --codex-sessions-dir /path/to/codex/sessions
 ```
 
 The scanner is incremental — it tracks each file's path and modification time, so re-running `scan` is fast and only processes new or changed files.
 
-By default, the scanner checks `~/.claude/projects/`, the Xcode Claude integration directory (`~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/projects/`), and `~/.codex/sessions/`, skipping any that don't exist. Use `--projects-dir` or `--codex-sessions-dir` to scan a custom location instead.
+By default, the scanner checks `~/.claude/projects/`, the Xcode Claude integration directory (`~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/projects/`), `~/.codex/sessions/`, and the Cowork local-agent-mode directories (`~/.config/Claude/` and `~/.config/Claude-3p/local-agent-mode-sessions/`), skipping any that don't exist. Use `--projects-dir`, `--codex-sessions-dir`, or `--cowork-sessions-dir` to scan a custom location instead.
 
 ---
 
