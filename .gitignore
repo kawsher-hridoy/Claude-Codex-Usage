@@ -1,2 +1,11 @@
 __pycache__/
 server.log
+
+# R2 backup secrets — never commit real credentials
+.env
+*.env
+r2.env
+# keep the placeholder template though
+!r2.env.template
+# local safety copies made by the restore command
+usage.db.bak-*
