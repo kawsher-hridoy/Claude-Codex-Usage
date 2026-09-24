@@ -14,16 +14,18 @@ usage() {
 backup-db-to-r2.sh — back up ~/.claude/usage.db to Cloudflare R2 (and restore it).
 
 Usage:
-  ./backup-db-to-r2.sh            Upload ~/.claude/usage.db to R2 (default).
+  ./backup-db-to-r2.sh            Snapshot ~/.claude/usage.db and upload to R2.
   ./backup-db-to-r2.sh --scan     Run `python3 cli.py scan` first, then upload.
-  ./backup-db-to-r2.sh --history  Also keep a timestamped copy under history/.
-  ./backup-db-to-r2.sh --restore  Download usage.db from R2 into ~/.claude/.
+  ./backup-db-to-r2.sh --restore  Restore the newest snapshot into ~/.claude/.
   ./backup-db-to-r2.sh --help     Show this help.
+
+Each upload writes a timestamped snapshot and keeps only the newest
+R2_MAX_SNAPSHOTS (default 3) in the bucket, deleting older ones.
 
 Credentials come from ${R2_ENV_FILE:-~/.config/r2-backup/r2.env}:
   Required: R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
             R2_BUCKET_NAME R2_ENDPOINT_URL
-  Optional: R2_PREFIX (default "claude-usage"), R2_KEEP_HISTORY (0/1)
+  Optional: R2_PREFIX (default "claude-usage"), R2_MAX_SNAPSHOTS (default 3)
 On first run the file is seeded from r2.env.template so you can fill it in.
 EOF
 }
@@ -37,7 +39,7 @@ REMOTE="R2"   # on-the-fly rclone remote, built from env vars below
 
 MODE="upload"
 DO_SCAN=0
-KEEP_HISTORY="${R2_KEEP_HISTORY:-0}"
+MAX_SNAPSHOTS="${R2_MAX_SNAPSHOTS:-3}"
 
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
@@ -47,7 +49,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --restore) MODE="restore" ;;
     --scan)    DO_SCAN=1 ;;
-    --history) KEEP_HISTORY=1 ;;
     -h|--help) usage; exit 0 ;;
     *)         die "unknown argument: $1 (try --help)" ;;
   esac
@@ -81,7 +82,6 @@ load_env() {
     *your_*here*) die "R2 keys still contain template placeholders — edit $ENV_FILE." ;;
   esac
   PREFIX="${R2_PREFIX:-claude-usage}"
-  KEY="$PREFIX/usage.db"
 }
 
 # ---- build on-the-fly rclone remote (never reads ~/.config/rclone) ---------
@@ -121,30 +121,45 @@ do_upload() {
   SNAPSHOT="$(mktemp)"
   sqlite3 "$DB_PATH" ".backup '$SNAPSHOT'"
 
-  info "Uploading usage.db ($(du -h "$SNAPSHOT" | cut -f1)) -> R2:$R2_BUCKET_NAME/$KEY"
-  rclone copyto "$SNAPSHOT" "$REMOTE:$R2_BUCKET_NAME/$KEY" --progress --s3-no-check-bucket
+  local key="$PREFIX/usage-$(date +%Y%m%d-%H%M%S).db"
+  info "Uploading snapshot ($(du -h "$SNAPSHOT" | cut -f1)) -> R2:$R2_BUCKET_NAME/$key"
+  rclone copyto "$SNAPSHOT" "$REMOTE:$R2_BUCKET_NAME/$key" --progress --s3-no-check-bucket
 
-  if [ "$KEEP_HISTORY" = "1" ]; then
-    local histkey="$PREFIX/history/usage-$(date +%Y%m%d-%H%M%S).db"
-    info "Keeping history copy -> R2:$R2_BUCKET_NAME/$histkey"
-    rclone copyto "$SNAPSHOT" "$REMOTE:$R2_BUCKET_NAME/$histkey" --s3-no-check-bucket
-  fi
+  prune_snapshots
 
   info ""
-  info "Done. Backed up to R2:"
-  rclone lsl "$REMOTE:$R2_BUCKET_NAME/$KEY"
+  info "Done. Snapshots in R2 (keeping newest $MAX_SNAPSHOTS):"
+  rclone lsl "$REMOTE:$R2_BUCKET_NAME/$PREFIX/" --include 'usage-*.db'
+}
+
+# ---- retention: keep only the newest N snapshots ---------------------------
+prune_snapshots() {
+  local listing n to_delete old
+  listing="$(rclone lsf "$REMOTE:$R2_BUCKET_NAME/$PREFIX/" --include 'usage-*.db' 2>/dev/null | sort)" || return 0
+  [ -n "$listing" ] || return 0
+  n="$(printf '%s\n' "$listing" | wc -l)"
+  [ "$n" -gt "$MAX_SNAPSHOTS" ] || return 0
+  to_delete="$(printf '%s\n' "$listing" | head -n "$((n - MAX_SNAPSHOTS))")"
+  while IFS= read -r old; do
+    [ -n "$old" ] || continue
+    info "Pruning old snapshot -> R2:$R2_BUCKET_NAME/$PREFIX/$old"
+    rclone deletefile "$REMOTE:$R2_BUCKET_NAME/$PREFIX/$old" --s3-no-check-bucket
+  done <<< "$to_delete"
 }
 
 # ---- restore ---------------------------------------------------------------
 do_restore() {
+  local newest
+  newest="$(rclone lsf "$REMOTE:$R2_BUCKET_NAME/$PREFIX/" --include 'usage-*.db' 2>/dev/null | sort | tail -n1)"
+  [ -n "$newest" ] || die "no snapshots found in R2:$R2_BUCKET_NAME/$PREFIX/"
   mkdir -p "$(dirname "$DB_PATH")"
   if [ -f "$DB_PATH" ]; then
     local bak="$DB_PATH.bak-$(date +%Y%m%d-%H%M%S)"
     mv "$DB_PATH" "$bak"
     info "Existing local DB moved to $bak"
   fi
-  info "Downloading R2:$R2_BUCKET_NAME/$KEY -> $DB_PATH"
-  rclone copyto "$REMOTE:$R2_BUCKET_NAME/$KEY" "$DB_PATH" --progress --s3-no-check-bucket
+  info "Downloading R2:$R2_BUCKET_NAME/$PREFIX/$newest -> $DB_PATH"
+  rclone copyto "$REMOTE:$R2_BUCKET_NAME/$PREFIX/$newest" "$DB_PATH" --progress --s3-no-check-bucket
   info "Restored $DB_PATH ($(sqlite3 "$DB_PATH" 'SELECT COUNT(*) FROM sessions;' 2>/dev/null || echo '?') sessions)."
 }
 
